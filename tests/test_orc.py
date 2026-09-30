@@ -2,12 +2,15 @@
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 ORC = [sys.executable, str(ROOT / "plugin" / "skills" / "orchestrate" / "scripts" / "orc")]
@@ -347,6 +350,325 @@ class OrcTest(unittest.TestCase):
         p = self.orc("report")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("done by the lead alone", p.stdout)
+
+
+    # Regression tests added before fixing the nine repository-review findings.
+    def review_plan(self, *, child=False, verify="checks", brief="b", extra=""):
+        body = f'''
+            goal = "review regressions"
+            checks = ["! grep -rq BROKEN --include=*.txt ."]
+            {extra}
+            [[task]]
+            id = "base"
+            role = "implementer"
+            why = "regression"
+            brief = "{brief}"
+            acceptance = ["ok"]
+            verify = "{verify}"
+        '''
+        if child:
+            body += '''
+                [[task]]
+                id = "child"
+                role = "implementer"
+                after = ["base"]
+                why = "regression"
+                brief = "b"
+                acceptance = ["ok"]
+                verify = "checks"
+            '''
+        return self.plan("review.toml", body)
+
+    def fake_script(self, body):
+        script = self.tmp / "wrapper.py"
+        script.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body))
+        script.chmod(0o755)
+        self.env["ORC_CODEX_BIN"] = str(script)
+
+    def test_failed_steer_preserves_partial_work_and_revokes_success(self):
+        self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
+        rid, st = self.state()
+        wt = Path(st["tasks"]["base"]["worktree"])
+        self.fake_script('''
+            import sys
+            from pathlib import Path
+            args = sys.argv
+            cwd = Path(args[args.index("-C") + 1])
+            (cwd / "unfinished.txt").write_text("valuable partial work")
+            sys.exit(1)
+        ''')
+        p = self.orc("steer", rid, "base", "fix something")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        _, st = self.state()
+        r = st["tasks"]["base"]
+        self.assertEqual(r["status"], "error")
+        saved = subprocess.check_output(["git", "show", f"{r['branch']}:unfinished.txt"], cwd=self.repo, text=True)
+        self.assertEqual(saved, "valuable partial work")
+        self.assertEqual(self.orc("merge", rid).returncode, 0)
+        self.assertTrue(wt.exists())
+        self.assertFalse(self.state()[1]["tasks"]["base"].get("merged"))
+        self.env["ORC_CODEX_BIN"] = str(ROOT / "tests" / "fake_codex.py")
+        self.assertEqual(self.orc("steer", rid, "base", "finish the work").returncode, 0)
+        self.assertEqual(self.orc("merge", rid).returncode, 0)
+        self.assertEqual((self.repo / "unfinished.txt").read_text(), "valuable partial work")
+
+    def test_merge_preserves_an_existing_merge_and_manual_resolution(self):
+        self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
+        rid, _ = self.state()
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=self.repo, text=True, capture_output=True)
+        self.assertEqual(git("checkout", "-qb", "other").returncode, 0)
+        (self.repo / "README").write_text("other branch\n")
+        self.assertEqual(git("add", "README").returncode, 0)
+        self.assertEqual(git("commit", "-qm", "other version").returncode, 0)
+        self.assertEqual(git("checkout", "-q", "main").returncode, 0)
+        (self.repo / "README").write_text("main branch\n")
+        self.assertEqual(git("add", "README").returncode, 0)
+        self.assertEqual(git("commit", "-qm", "main version").returncode, 0)
+        self.assertEqual(git("merge", "other").returncode, 1)
+        resolution = "valuable in-progress manual resolution\n"
+        (self.repo / "README").write_text(resolution)
+        merge_head = (self.repo / ".git" / "MERGE_HEAD").read_text()
+        p = self.orc("merge", rid)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertEqual((self.repo / "README").read_text(), resolution)
+        self.assertEqual((self.repo / ".git" / "MERGE_HEAD").read_text(), merge_head)
+
+    def test_steering_parent_invalidates_descendants_and_keeps_new_commits(self):
+        self.assertEqual(self.orc("run", self.review_plan(child=True)).returncode, 0)
+        rid, st = self.state()
+        branch = st["tasks"]["base"]["branch"]
+        wt = Path(st["tasks"]["base"]["worktree"])
+        self.assertEqual(self.orc("steer", rid, "base", "change base").returncode, 0)
+        updated = (wt / "base.txt").read_text()
+        _, st = self.state()
+        self.assertEqual(st["tasks"]["child"]["status"], "stale")
+        p = self.orc("merge", rid, "child")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertFalse(self.state()[1]["tasks"]["base"].get("merged"))
+        self.assertTrue(wt.exists())
+        self.assertEqual(subprocess.check_output(["git", "show", f"{branch}:base.txt"], cwd=self.repo, text=True), updated)
+        self.assertEqual(self.orc("merge", rid).returncode, 0)
+        self.assertEqual((self.repo / "base.txt").read_text(), updated)
+        self.assertFalse((self.repo / "child.txt").exists())
+
+    def test_steering_invalidates_transitive_readers_and_writers(self):
+        plan = self.review_plan(child=True)
+        body = (self.repo / plan).read_text() + '''
+            [[task]]
+            id = "review"
+            role = "reviewer"
+            after = ["child"]
+            why = "review child"
+            brief = "review"
+        '''
+        (self.repo / plan).write_text(body)
+        self.assertEqual(self.orc("run", plan).returncode, 0)
+        rid, _ = self.state()
+        self.assertEqual(self.orc("steer", rid, "base", "change base").returncode, 0)
+        _, st = self.state()
+        self.assertEqual(st["tasks"]["child"]["status"], "stale")
+        self.assertEqual(st["tasks"]["review"]["status"], "stale")
+        self.assertNotEqual(self.orc("steer", rid, "child", "continue").returncode, 0)
+
+    def test_merge_checks_parent_ancestry_even_without_a_stale_status(self):
+        self.assertEqual(self.orc("run", self.review_plan(child=True)).returncode, 0)
+        rid, st = self.state()
+        wt = Path(st["tasks"]["base"]["worktree"])
+        (wt / "new-parent.txt").write_text("new parent code")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+        subprocess.run(["git", "commit", "-qm", "parent changed outside orc"], cwd=wt, check=True)
+        p = self.orc("merge", rid, "child")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertTrue(wt.exists())
+        self.assertFalse(self.state()[1]["tasks"]["base"].get("merged"))
+
+    def test_setup_preserves_malformed_settings_even_with_force(self):
+        cfg = self.tmp / "claude-config"
+        cfg.mkdir()
+        self.env["CLAUDE_CONFIG_DIR"] = str(cfg)
+        settings = cfg / "settings.json"
+        malformed = '{"model":"opus","permissions":{"deny":["Bash(rm *)"]},'
+        settings.write_text(malformed)
+        for args in ((), ("--force",)):
+            with self.subTest(args=args):
+                settings.write_text(malformed)
+                p = self.orc("setup", *args)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertEqual(settings.read_text(), malformed)
+
+    def error_after_final(self, predicate):
+        self.fake_script(f'''
+            import json, runpy, sys
+            runpy.run_path({str(ROOT / "tests" / "fake_codex.py")!r}, run_name="__main__")
+            if {predicate}:
+                print(json.dumps({{"type": "turn.failed", "error": {{"message": "failure after final"}}}}))
+                sys.exit(1)
+        ''')
+
+    def test_worker_error_with_final_json_does_not_pass(self):
+        plan = self.review_plan()
+        self.error_after_final("True")
+        p = self.orc("run", plan)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        _, st = self.state()
+        self.assertEqual(st["tasks"]["base"]["status"], "error")
+        self.assertEqual(len(st["tasks"]["base"]["calls"]), 1)
+
+    def test_readonly_error_with_final_json_does_not_pass(self):
+        plan = self.plan("reader.toml", '''
+            goal = "read"
+            [[task]]
+            id = "read"
+            role = "reviewer"
+            why = "read"
+            brief = "read"
+        ''')
+        self.error_after_final("True")
+        p = self.orc("run", plan)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertEqual(self.state()[1]["tasks"]["read"]["status"], "error")
+
+    def test_verifier_error_with_pass_json_does_not_verify(self):
+        plan = self.review_plan(verify="codex")
+        self.error_after_final("'verdict.schema.json' in sys.argv[sys.argv.index('--output-schema') + 1]")
+        p = self.orc("run", plan)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        r = self.state()[1]["tasks"]["base"]
+        self.assertEqual(r["status"], "uncertain")
+        self.assertEqual(r["verdicts"][0]["verdict"], "uncertain")
+        self.assertEqual(self.orc("merge").returncode, 0)
+        self.assertFalse((self.repo / "base.txt").exists())
+
+    def test_repair_error_with_final_json_does_not_pass(self):
+        plan = self.review_plan(brief="FAKE_BREAK_CHECK")
+        self.error_after_final("'resume' in sys.argv")
+        p = self.orc("run", plan)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertEqual(self.state()[1]["tasks"]["base"]["status"], "error")
+
+    def test_steer_error_with_final_json_does_not_pass(self):
+        self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
+        rid, _ = self.state()
+        self.error_after_final("'resume' in sys.argv")
+        p = self.orc("steer", rid, "base", "change base")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertEqual(self.state()[1]["tasks"]["base"]["status"], "error")
+
+    def test_quota_skipped_implementer_can_resume_with_existing_worktree(self):
+        plan = self.review_plan()
+        limits = Path(self.env["ORC_HOME"]) / "codex-limits.json"
+        limits.parent.mkdir(parents=True)
+        limits.write_text(json.dumps({"rate_limits": {"primary": {
+            "used_percent": 95, "window_minutes": 300, "resets_at": 4102444800}}}))
+        self.assertEqual(self.orc("run", plan).returncode, 2)
+        rid, st = self.state()
+        self.assertEqual(st["tasks"]["base"]["status"], "skipped")
+        limits.write_text("{}")
+        p = self.orc("resume", rid)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.state()[1]["tasks"]["base"]["status"], "checks-passed")
+        self.assertEqual(self.orc("merge", rid).returncode, 0)
+        self.assertTrue((self.repo / "base.txt").exists())
+
+    def test_partial_merge_keeps_resources_for_pending_child_and_reader(self):
+        plan = self.review_plan(child=True)
+        body = (self.repo / plan).read_text() + '''
+            [[task]]
+            id = "review"
+            role = "reviewer"
+            after = ["base"]
+            why = "read base"
+            brief = "read base"
+        '''
+        (self.repo / plan).write_text(body)
+        self.assertEqual(self.orc("run", plan, "--only", "base").returncode, 0)
+        rid, st = self.state()
+        wt = Path(st["tasks"]["base"]["worktree"])
+        self.assertEqual(self.orc("merge", rid, "base").returncode, 0)
+        self.assertTrue(wt.exists())
+        p = self.orc("resume", rid)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        _, st = self.state()
+        self.assertEqual(st["tasks"]["review"]["result"]["summary"], "fake worker in base")
+        self.assertTrue((Path(st["tasks"]["child"]["worktree"]) / "base.txt").exists())
+        self.assertEqual(self.orc("merge", rid).returncode, 0)
+        self.assertFalse(wt.exists())
+        self.assertTrue((self.repo / "child.txt").exists())
+
+    def test_plan_rejects_invalid_numeric_execution_settings(self):
+        for extra, field in [('max_parallel = 0', 'max_parallel'), ('max_parallel = -1', 'max_parallel'),
+                             ('max_parallel = 1.5', 'max_parallel'), ('max_parallel = true', 'max_parallel'),
+                             ('quota_stop = 101', 'quota_stop'), ('quota_stop = nan', 'quota_stop'),
+                             ('quota_stop = -1', 'quota_stop')]:
+            with self.subTest(extra=extra):
+                p = self.orc("check", self.review_plan(extra=extra))
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn(field, p.stdout)
+                self.assertNotIn("Traceback", p.stderr)
+        for extra, field in [('timeout_min = 0', 'timeout_min'), ('max_repairs = -1', 'max_repairs'),
+                             ('timeout_min = "bad"', 'timeout_min'), ('max_repairs = 1.5', 'max_repairs')]:
+            with self.subTest(extra=extra):
+                plan = self.review_plan()
+                with open(self.repo / plan, "a") as f:
+                    f.write(extra + "\n")
+                p = self.orc("check", plan)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn(field, p.stdout)
+                self.assertNotIn("Traceback", p.stderr)
+
+    def test_queued_call_rechecks_quota_after_acquiring_slot(self):
+        with patch.dict(os.environ, self.env):
+            mod = runpy.run_path(ORC[1], run_name="orc_test")
+        home = Path(self.env["ORC_HOME"])
+        home.mkdir()
+        limits = home / "codex-limits.json"
+        limits.write_text("{}")
+        waiting, release = threading.Event(), threading.Event()
+        class HeldSlot:
+            def __enter__(self):
+                waiting.set()
+                if not release.wait(5):
+                    raise RuntimeError("test did not release the slot")
+            def __exit__(self, *args):
+                pass
+        records, errors = [], []
+        def run_call():
+            try:
+                with patch.dict(os.environ, self.env):
+                    records.append(mod["codex_exec"](model="gpt-6.1-sol", effort="high", sandbox="read-only",
+                        cwd=self.repo, prompt="q", logdir=self.tmp / "queued", name="q", slots=HeldSlot()))
+            except Exception as e:
+                errors.append(e)
+        worker = threading.Thread(target=run_call)
+        worker.start()
+        try:
+            self.assertTrue(waiting.wait(5))
+            limits.write_text(json.dumps({"rate_limits": {"primary": {
+                "used_percent": 95, "window_minutes": 300, "resets_at": 4102444800}}}))
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(records[0].get("skipped"), records)
+        self.assertFalse((Path(self.env["CODEX_HOME"]) / "fake-state.json").exists())
+
+    def test_usage_snapshot_is_saved_before_a_slot_is_released(self):
+        with patch.dict(os.environ, self.env):
+            mod = runpy.run_path(ORC[1], run_name="orc_test")
+        snapshots = []
+        home = Path(self.env["ORC_HOME"])
+        class ObservedSlot:
+            def __enter__(self):
+                pass
+            def __exit__(self, *args):
+                snapshots.append((home / "codex-limits.json").exists())
+        with patch.dict(os.environ, self.env):
+            rec = mod["codex_exec"](model="gpt-6.1-sol", effort="high", sandbox="workspace-write", cwd=self.repo,
+                prompt="q", logdir=self.tmp / "usage", name="usage", schema="worker-result", slots=ObservedSlot())
+        self.assertIsNone(rec["error"])
+        self.assertEqual(snapshots, [True])
 
 
 class PackagingTest(unittest.TestCase):
