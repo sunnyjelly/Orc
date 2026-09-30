@@ -35,7 +35,7 @@ Both ship together as one Claude Code plugin, and each is also a standalone `.sk
 In Claude Code, whether in the desktop app's Code tab or the CLI:
 
 ```
-/plugin marketplace add SteliosRapt/Playground
+/plugin marketplace add sunnyjelly/Orc
 /plugin install orc@orc-tools
 ```
 
