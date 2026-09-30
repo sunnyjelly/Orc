@@ -331,6 +331,18 @@ def load_plan(path: str) -> tuple[dict, list[str], list[str]]:
     except (OSError, tomllib.TOMLDecodeError) as e:
         return {}, [f"cannot read plan: {e}"], []
     errs, warns = [], []
+    def integer(value, field, minimum, default):
+        if type(value) is not int or value < minimum:
+            errs.append(f"{field} must be an integer >= {minimum}")
+            return default
+        return value
+
+    plan["max_parallel"] = integer(plan.get("max_parallel", 3), "max_parallel", 1, 3)
+    quota = plan.get("quota_stop", 90)
+    if type(quota) not in (int, float) or not 0 < quota <= 100:
+        errs.append("quota_stop must be a finite number > 0 and <= 100")
+    else:
+        plan["quota_stop"] = float(quota)
     plan.setdefault("goal", "")
     risk = plan.setdefault("risk", "medium")
     if risk not in VERIFY_BY_RISK:
@@ -378,8 +390,8 @@ def load_plan(path: str) -> tuple[dict, list[str], list[str]]:
         t["files"] = list(t.get("files", []))
         t["checks"] = list(plan.get("checks", [])) + list(t.get("checks", []))
         t["network"] = bool(t.get("network", defaults.get("network", False)))
-        t["timeout_min"] = int(t.get("timeout_min", defaults.get("timeout_min", 30)))
-        t["max_repairs"] = int(t.get("max_repairs", defaults.get("max_repairs", 1)))
+        t["timeout_min"] = integer(t.get("timeout_min", defaults.get("timeout_min", 30)), f"{tid}: timeout_min", 1, 30)
+        t["max_repairs"] = integer(t.get("max_repairs", defaults.get("max_repairs", 1)), f"{tid}: max_repairs", 0, 1)
         if t["writes"] and t["verify"] != "none" and not t["checks"]:
             warns.append(f"{tid}: no `checks`; add at least a test or build command so verification has hard evidence")
     by_id = {t.get("id"): t for t in tasks}
@@ -518,6 +530,10 @@ def quota_blocked(quota_stop: float) -> str | None:
     return None
 
 
+def call_succeeded(call: dict) -> bool:
+    return call.get("final") is not None and not call.get("error")
+
+
 def codex_exec(*, model: str, effort: str, sandbox: str, cwd: Path, prompt: str, logdir: Path, name: str,
                schema: str | None = None, resume: str | None = None, network: bool = False, web: bool = False,
                timeout_min: int = 30, slots: threading.Semaphore | None = None, quota_stop: float = 90,
@@ -539,10 +555,11 @@ def codex_exec(*, model: str, effort: str, sandbox: str, cwd: Path, prompt: str,
     (logdir / f"{name}.prompt.md").write_text(prompt)
     rec = {"name": name, "thread": None, "usage": {k: 0 for k in USAGE_KEYS}, "final": None, "error": None,
            "effort": effort, "model": model}
-    if (why := quota_blocked(quota_stop)):
-        rec["error"], rec["skipped"] = f"skipped: {why}", True
-        return rec
     with (slots or threading.Semaphore()):
+        if (why := quota_blocked(quota_stop)):
+            rec["error"], rec["skipped"] = f"skipped: {why}", True
+            return rec
+        out.unlink(missing_ok=True)  # a failed retry must never reuse an earlier final message
         start = time.time()
         with open(logdir / f"{name}.events.jsonl", "w") as ev, open(logdir / f"{name}.stderr.log", "w") as er:
             try:
@@ -553,31 +570,31 @@ def codex_exec(*, model: str, effort: str, sandbox: str, cwd: Path, prompt: str,
             except FileNotFoundError:
                 rc = "codex not found (set ORC_CODEX_BIN or install @openai/codex)"
         rec["seconds"] = round(time.time() - start, 1)
-    for line in (logdir / f"{name}.events.jsonl").read_text(errors="replace").splitlines():
+        for line in (logdir / f"{name}.events.jsonl").read_text(errors="replace").splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            kind = ev.get("type")
+            if kind == "thread.started":
+                rec["thread"] = ev.get("thread_id")
+            elif kind == "turn.completed":
+                rec["usage"] = add_usage(rec["usage"], ev.get("usage") or {})
+            elif kind in ("turn.failed", "error"):
+                rec["error"] = clip((ev.get("error") or {}).get("message") or ev.get("message") or kind, 300)
+        rec["thread"] = rec["thread"] or resume
         try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        kind = ev.get("type")
-        if kind == "thread.started":
-            rec["thread"] = ev.get("thread_id")
-        elif kind == "turn.completed":
-            rec["usage"] = add_usage(rec["usage"], ev.get("usage") or {})
-        elif kind in ("turn.failed", "error"):
-            rec["error"] = clip((ev.get("error") or {}).get("message") or ev.get("message") or kind, 300)
-    rec["thread"] = rec["thread"] or resume
-    try:
-        text = out.read_text()
-        rec["final"] = json.loads(text) if schema else (text.strip() or None)
-    except (OSError, ValueError):
-        pass
-    if rec["final"] is None and not rec["error"]:
-        rec["error"] = f"exit {rc}; no valid final message" + (f": {clip(tail((logdir / f'{name}.stderr.log').read_text(), 3), 300)}" if rc else "")
-    if rc not in (0, None) and not rec["error"]:
-        rec["error"] = f"exit {rc}"
-    rec["cost"] = round(openai_cost(model, rec["usage"], pricing if pricing is not None else load_pricing()), 4)
-    save_codex_limits(codex_limits(rec["thread"]))
-    return rec
+            text = out.read_text()
+            rec["final"] = json.loads(text) if schema else (text.strip() or None)
+        except (OSError, ValueError):
+            pass
+        if rec["final"] is None and not rec["error"]:
+            rec["error"] = f"exit {rc}; no valid final message" + (f": {clip(tail((logdir / f'{name}.stderr.log').read_text(), 3), 300)}" if rc else "")
+        if rc not in (0, None) and not rec["error"]:
+            rec["error"] = f"exit {rc}"
+        rec["cost"] = round(openai_cost(model, rec["usage"], pricing if pricing is not None else load_pricing()), 4)
+        save_codex_limits(codex_limits(rec["thread"]))
+        return rec
 
 
 class Run:
@@ -689,8 +706,10 @@ class Run:
     def run_task(self, t: dict) -> dict:
         tdir = self.dir / t["id"]
         tdir.mkdir(parents=True, exist_ok=True)
-        rec = {"id": t["id"], "role": t["role"], "effort": t["effort"], "model": t["model"], "verify": t["verify"],
-               "status": "running", "calls": [], "started": now_iso()}
+        rec = self.state["tasks"].get(t["id"], {})
+        rec.update(id=t["id"], role=t["role"], effort=t["effort"], model=t["model"], verify=t["verify"],
+                   status="running", started=now_iso(), error=None)
+        rec.setdefault("calls", [])
         self.state["tasks"][t["id"]] = rec
         self.save()
         self.log(f"▶ {t['id']} ({t['role']}, {t['effort']})")
@@ -701,11 +720,12 @@ class Run:
                 cwd = self.repo or Path.cwd()
                 if t.get("base_writer"):
                     cwd = Path(self.state["tasks"][t["base_writer"]]["worktree"])  # see the code it builds on
-                call = self.codex(t, "worker", self.worker_prompt(t), "worker-result", cwd, "read-only")
+                name = f"worker{len(rec['calls'])}" if rec["calls"] else "worker"
+                call = self.codex(t, name, self.worker_prompt(t), "worker-result", cwd, "read-only")
                 rec["calls"].append(call)
                 rec["result"] = call["final"]
-                rec["status"] = call["final"]["status"] if call["final"] else ("skipped" if call.get("skipped") else "error")
-                rec["error"] = call["error"] if not call["final"] else None
+                rec["status"] = call["final"]["status"] if call_succeeded(call) else ("skipped" if call.get("skipped") else "error")
+                rec["error"] = None if call_succeeded(call) else call["error"]
         except Exception as e:  # keep other tasks running
             rec["status"], rec["error"] = "error", f"{type(e).__name__}: {e}"
         rec["finished"] = now_iso()
@@ -716,18 +736,26 @@ class Run:
     def implement(self, t: dict, rec: dict, tdir: Path) -> None:
         parent = t.get("base_writer")
         start_ref = self.state["tasks"][parent]["branch"] if parent else self.base
-        branch = f"orc/{self.id}/{t['id']}"
-        wt = ORC_HOME / "worktrees" / f"{self.repo.name}-{self.id}" / t["id"]
-        wt.parent.mkdir(parents=True, exist_ok=True)
-        git("worktree", "add", "-q", "-b", branch, str(wt), start_ref, cwd=self.repo)
-        base = git("rev-parse", start_ref, cwd=self.repo)
-        rec.update(branch=branch, worktree=str(wt), base=base, parent=parent)
-        self.save()
+        if rec.get("worktree"):
+            wt, base = Path(rec["worktree"]), rec["base"]
+            if not wt.is_dir():
+                raise RuntimeError("the skipped task's worktree no longer exists; start a new plan")
+        else:
+            branch = f"orc/{self.id}/{t['id']}"
+            wt = ORC_HOME / "worktrees" / f"{self.repo.name}-{self.id}" / t["id"]
+            wt.parent.mkdir(parents=True, exist_ok=True)
+            git("worktree", "add", "-q", "-b", branch, str(wt), start_ref, cwd=self.repo)
+            base = git("rev-parse", start_ref, cwd=self.repo)
+            rec.update(branch=branch, worktree=str(wt), base=base, parent=parent)
+            self.save()
 
-        call = self.codex(t, "worker", self.worker_prompt(t), "worker-result", wt, "workspace-write")
+        thread = next((c["thread"] for c in reversed(rec["calls"]) if c.get("thread") and
+                       c["name"].startswith(("worker", "repair", "steer"))), None)
+        name = f"worker{len(rec['calls'])}" if rec["calls"] else "worker"
+        call = self.codex(t, name, self.worker_prompt(t), "worker-result", wt, "workspace-write", resume=thread)
         rec["calls"].append(call)
         rec["result"], thread = call["final"], call["thread"]
-        if not call["final"]:
+        if not call_succeeded(call):
             rec["status"], rec["error"] = ("skipped" if call.get("skipped") else "error"), call["error"]
             self.commit(t, wt, f"orc({t['id']}): partial work")
             return
@@ -741,10 +769,11 @@ class Run:
                 break
             feedback = self.repair_feedback([c for c in rec["checks"] if c["exit"] != 0],
                                             [v for v in rec["verdicts"] if v["verdict"] != "pass"])
-            call = self.codex(t, f"repair{round_no + 1}", feedback, "worker-result", wt, "workspace-write", resume=thread)
+            call = self.codex(t, f"repair{round_no + 1}" if name == "worker" else f"repair{len(rec['calls'])}",
+                              feedback, "worker-result", wt, "workspace-write", resume=thread)
             rec["calls"].append(call)
-            if not call["final"]:
-                rec["error"] = call["error"]
+            if not call_succeeded(call):
+                rec["status"], rec["error"] = ("skipped" if call.get("skipped") else "error"), call["error"]
                 self.commit(t, wt, f"orc({t['id']}): partial repair")  # keep the work for the lead
                 break
             rec["result"] = call["final"]
@@ -760,7 +789,7 @@ class Run:
         rec["checks"] = self.run_checks(t, wt, round_no)
         failed = [c for c in rec["checks"] if c["exit"] != 0]
         verdicts = [] if failed or not verify else self.verify(t, rec, wt, base)
-        rec["verdicts"] = [{"kind": v["name"], **(v["final"] or {"verdict": "uncertain", "summary": v["error"] or "no verdict",
+        rec["verdicts"] = [{"kind": v["name"], **(v["final"] if call_succeeded(v) else {"verdict": "uncertain", "summary": v["error"] or "no verdict",
                                                               "issues": [], "criteria": []})} for v in verdicts]
         bad = [v for v in rec["verdicts"] if v["verdict"] != "pass"]
         if failed or any(v["verdict"] == "fail" for v in bad):
@@ -783,20 +812,26 @@ class Run:
 
     # ------------------------------------------------------------ scheduling
 
+    def invalidate_dependents(self, tid: str) -> None:
+        for child, deps in ancestors(self.plan["task"]).items():
+            rec = self.state["tasks"].get(child)
+            if tid in deps and rec and not rec.get("merged") and (rec.get("calls") or rec.get("worktree")):
+                rec["status"], rec["error"] = "stale", f"{tid} was steered; start a new plan on the updated code"
+
     def execute(self, only: set[str] | None = None) -> None:
         tasks = [t for t in self.plan["task"] if not only or t["id"] in only]
         self.state.setdefault("tasks", {})
         done: set[str] = {tid for tid, r in self.state["tasks"].items() if r.get("status") in ("done", "partial", "verified", "checks-passed", "unverified")}
         pending = {t["id"]: t for t in tasks if t["id"] not in done}
         running: dict[cf.Future, str] = {}
-        finished = set(self.state["tasks"])  # judge a dependency only once it has finished (statuses change mid-repair)
+        finished = set(self.state["tasks"]) - set(pending)  # retries are not finished dependencies
         with cf.ThreadPoolExecutor(max(len(pending), 1)) as ex:
             while pending or running:
                 for tid, t in list(pending.items()):
                     deps = [self.state["tasks"][d]["status"] for d in t["after"] if d in finished]
-                    if any(s in ("error", "failed", "blocked", "skipped", "uncertain") for s in deps):
-                        self.state["tasks"][tid] = {"id": tid, "role": t["role"], "status": "skipped", "calls": [],
-                                                    "error": "a dependency did not succeed"}
+                    if any(s in ("error", "failed", "blocked", "skipped", "uncertain", "stale") for s in deps):
+                        rec = self.state["tasks"].setdefault(tid, {"id": tid, "role": t["role"], "calls": []})
+                        rec.update(status="skipped", error="a dependency did not succeed")
                         finished.add(tid)
                         del pending[tid]
                     elif all(d in done for d in t["after"]):
@@ -805,7 +840,8 @@ class Run:
                 if not running:
                     if pending:  # unreachable dependencies (e.g. filtered by --only)
                         for tid in pending:
-                            self.state["tasks"][tid] = {"id": tid, "status": "skipped", "calls": [], "error": "dependency not run"}
+                            rec = self.state["tasks"].setdefault(tid, {"id": tid, "calls": []})
+                            rec.update(status="skipped", error="dependency not run")
                     break
                 fin, _ = cf.wait(running, return_when=cf.FIRST_COMPLETED)
                 for f in fin:
@@ -995,6 +1031,8 @@ def cmd_steer(a) -> int:
         die(f"unknown task {a.task} in run {run.id}")
     if rec.get("merged"):
         die(f"{a.task} is already merged; start a new plan for further changes")
+    if rec.get("status") == "stale":
+        die(f"{a.task} has stale dependencies; start a new plan on the updated code")
     thread = next((c["thread"] for c in rec.get("calls", []) if c.get("thread") and c["name"].startswith(("worker", "repair", "steer"))), None)
     if not thread:
         die("task has no Codex thread to resume")
@@ -1003,10 +1041,17 @@ def cmd_steer(a) -> int:
     msg = a.message + "\n\nReply with the same JSON schema describing the final state (all changes so far)."
     cwd = Path(rec["worktree"]) if t["writes"] else (Path(run.state["tasks"][t["base_writer"]]["worktree"])
                                                      if t.get("base_writer") else repo or Path.cwd())
+    if not cwd.is_dir():
+        die("the dependency worktree no longer exists; start a new plan")
+    rec.update(status="running", error=None, result=None, checks=[], verdicts=[])
+    run.invalidate_dependents(a.task)
+    run.save()  # revoke the previous gates before the worker can change anything
     call = run.codex(t, f"steer{len(rec['calls'])}", msg, "worker-result", cwd, t["sandbox"], resume=thread)
     rec["calls"].append(call)
-    if not call["final"]:
-        rec["error"] = call["error"]
+    if not call_succeeded(call):
+        rec["status"], rec["error"] = ("skipped" if call.get("skipped") else "error"), call["error"]
+        if t["writes"]:
+            run.commit(t, cwd, f"orc({t['id']}): partial steer")
     elif t["writes"]:
         rec["result"], rec["error"] = call["final"], None
         if call["final"]["status"] == "blocked":
@@ -1017,6 +1062,7 @@ def cmd_steer(a) -> int:
         rec["diffstat"] = git("diff", "--shortstat", rec["base"], "HEAD", cwd=cwd, check=False)
     else:
         rec["result"], rec["status"], rec["error"] = call["final"], call["final"]["status"], None
+    rec["finished"] = now_iso()
     run.save()
     print("\n".join(task_line(rec)))
     skipped = [tid for tid, r in run.state["tasks"].items() if r.get("status") == "skipped"]
@@ -1034,8 +1080,6 @@ def cmd_resume(a) -> int:
     if not todo:
         print(f"nothing to resume in run {run.id}")
         return 0
-    for tid in todo:
-        run.state["tasks"].pop(tid, None)
     print(f"orc run {run.id} resumed ({len(todo)} tasks).", flush=True)
     run.execute(todo)
     run.state["finished"] = now_iso()
@@ -1048,35 +1092,87 @@ def cmd_resume(a) -> int:
 
 def cmd_merge(a) -> int:
     repo = repo_root() or die("not in a git repository")
-    run_dir = find_run(repo, a.run)
-    state = read_json(run_dir / "state.json")
+    def git_path(name):
+        path = Path(git("rev-parse", "--git-path", name, cwd=repo))
+        return path if path.is_absolute() else repo / path
+
+    for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"):
+        if git_path(name).exists():
+            print("another Git operation is in progress; finish or abort it before running orc merge")
+            return 1
+    run = load_run(repo, a.run)
+    run_dir, state = run.dir, run.state
+
+    def head(rec):
+        ref = rec.get("branch")
+        sha = git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=repo, check=False) if ref else ""
+        return sha or rec.get("merged_head")
+
+    def included(ancestor, descendant):
+        return bool(ancestor and descendant) and subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant], cwd=repo, capture_output=True).returncode == 0
+
+    def parents(rec):
+        seen = set()
+        while (parent := rec.get("parent")) and parent not in seen:
+            seen.add(parent)
+            rec = state["tasks"].get(parent, {})
+            yield parent, rec
+
     want = set(a.tasks) if a.tasks else None
     merged, code = [], 0
     for tid in state["order"]:
         r = state["tasks"].get(tid, {})
         if not r.get("branch") or r.get("merged") or (want and tid not in want):
             continue
+        if r["status"] == "stale":
+            print(f"skip {tid}: stale dependencies; start a new plan on the updated code")
+            if want:
+                code = 1
+                break
+            continue
         if not want and r["status"] not in ("verified", "checks-passed"):
             print(f"skip {tid}: status {r['status']} (name it explicitly to merge anyway)")
             continue
         parent = r.get("parent")
+        task_head = head(r)
+        stale = next((pid for pid, pr in parents(r) if not included(head(pr), task_head)), None)
+        if stale:
+            r["status"], r["error"] = "stale", f"does not contain the current commits of {stale}; start a new plan"
+            print(f"cannot merge {tid}: {r['error']}")
+            code = 1
+            break
         if parent and not state["tasks"].get(parent, {}).get("merged"):
             print(f"note: {tid} is built on {parent}, so this also merges {parent}'s commits")
         p = subprocess.run(["git", "merge", "--no-ff", "--no-edit", "-m", f"orc: merge {tid} ({state['goal'][:60]})", r["branch"]],
                            cwd=repo, text=True, capture_output=True)
         if p.returncode != 0:
-            subprocess.run(["git", "merge", "--abort"], cwd=repo, capture_output=True)
+            if git_path("MERGE_HEAD").exists():  # only abort the merge started by this invocation
+                subprocess.run(["git", "merge", "--abort"], cwd=repo, capture_output=True)
             print(f"✗ {tid}: merge conflict; aborted. Resolve by hand: git merge {r['branch']}\n{clip(p.stdout + p.stderr, 400)}")
             code = 1
             break
-        r["merged"] = now_iso()
-        if parent and not state["tasks"].get(parent, {}).get("merged"):
-            state["tasks"][parent]["merged"] = r["merged"]  # its commits came along
+        r["merged"], r["merged_head"] = now_iso(), task_head
+        for _, pr in parents(r):
+            parent_head = head(pr)
+            if not pr.get("merged") and included(parent_head, "HEAD"):
+                pr["merged"], pr["merged_head"] = r["merged"], parent_head
         merged.append(tid)
-    for r in state["tasks"].values():  # remove worktrees only once nothing still builds on them
-        if r.get("merged") and r.get("worktree") and Path(r["worktree"]).exists():
-            git("worktree", "remove", "--force", r["worktree"], cwd=repo, check=False)
-            git("branch", "-D", r["branch"], cwd=repo, check=False)
+    needed = set()
+    dependencies = ancestors(run.plan["task"])
+    for t in run.plan["task"]:
+        rec = state["tasks"].get(t["id"], {})
+        pending = not rec.get("merged") if t["writes"] else rec.get("status") not in ("done", "partial")
+        if pending and not rec.get("cleaned"):
+            needed.update(dependencies[t["id"]])
+    for tid, r in state["tasks"].items():
+        if (tid not in needed and r.get("merged") and r.get("worktree") and Path(r["worktree"]).exists()
+                and included(head(r), "HEAD")):
+            removed = subprocess.run(["git", "worktree", "remove", r["worktree"]], cwd=repo, capture_output=True)
+            if removed.returncode == 0:
+                git("branch", "-d", r["branch"], cwd=repo, check=False)
+            else:
+                print(f"retained {tid}'s worktree: it has local changes; inspect it before orc clean")
     write_json(run_dir / "state.json", state)
     print(f"merged: {', '.join(merged) or 'nothing'}")
     return code
@@ -1189,7 +1285,7 @@ def cmd_ask(a) -> int:
         f.write(json.dumps(entry) + "\n")
     footer = (f"— {a.model} · {a.effort}{' · web' if entry['web'] else ''} · "
               f"{fmt_tok(rec['usage']['input_tokens'] + rec['usage']['output_tokens'])} tok · ≈${rec.get('cost') or 0:.2f} · {fmt_secs(rec.get('seconds'))}")
-    if rec["final"] is None:
+    if not call_succeeded(rec):
         print(f"ask failed: {rec['error']}\n{footer}")
         return 1
     if a.research:
@@ -1241,7 +1337,7 @@ def cmd_setup(a) -> int:
         shutil.copytree(ROOT, app, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     command = f'python3 "{app / "orc"}" statusline'
     path = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "settings.json"
-    settings = read_json(path, {}) if path.exists() else {}
+    settings = read_json(path) if path.exists() else {}
     if not isinstance(settings, dict):
         print(f"{path} is not valid JSON; not changing it. Set statusLine.command to: {command}")
         return 1

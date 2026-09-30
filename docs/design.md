@@ -44,7 +44,11 @@ The repo is a Claude Code plugin marketplace: `.claude-plugin/marketplace.json` 
 
 - **Checks run outside the sandbox.** Plan `checks` run on the user's machine, outside the Codex sandbox, on code a worker wrote. A worker could change a test or a `package.json` script. Only configure checks you'd run on an untrusted branch. Running checks inside `codex sandbox` is a possible hardening step, but not implemented.
 - **Web findings are marked untrusted.** Explorer or reviewer findings from `web = true` tasks are labelled as untrusted data in later workers' prompts. Web pages are a prompt-injection path into implementers.
-- **Branch cleanup is limited.** `merge` and `clean` only remove orc's own worktrees (under `~/.orc/worktrees`) and `orc/<run>/…` branches. Failed repair rounds are committed first, so their work isn't lost.
+- **Branch cleanup preserves unfinished work.** `merge` retains branches and worktrees while unfinished descendants need them, verifies that current ancestor commits are included before marking them merged, and removes only clean worktrees whose commits are in the current branch. `clean` explicitly removes the run's unmerged worktrees and branches. Failed workers, repairs, and steers are committed before returning an error, so partial work remains available.
+- **Execution errors revoke success.** A call succeeds only if it has a final message and no process or event error. Failed verifiers produce `uncertain`; a final `pass` cannot override an execution error. Steering revokes previous gates before running the worker.
+- **Changed dependencies invalidate old results.** Steering a task marks previously started descendants `stale`. Their branches and call history remain available, but they cannot be steered or merged through orc. Merge the updated upstream task and write a new plan on that code. Dependents that never started remain skipped and can resume normally.
+- **Git operations are kept separate.** Merge refuses to run while a merge, rebase, cherry-pick, or revert is already in progress. It aborts only a merge started by its own invocation.
+- **Settings failures preserve the file.** Setup refuses to overwrite existing Claude settings that cannot be read as a JSON object, including with `--force`.
 
 ## Why a CLI and a skill (not an MCP server, not Claude subagents)
 
@@ -91,6 +95,8 @@ Model short names live in `MODEL_ALIASES`: `sol` → `gpt-6.1-sol`, `luna` → `
 | Bounded repair | `max_repairs` (default 1) resumes the implementer's warm thread; after that the lead decides (steer, re-plan or do it itself) |
 | Structured handoffs | `--output-schema` for worker results and verdicts; everything written to disk |
 | Budget awareness | `quota_stop`: no new Codex calls once a Codex window passes 90%; the status line shows live Claude and Codex usage; the skill says to shrink plans when usage is high |
+
+Quota is checked after acquiring a Codex process slot, and the completed call's usage snapshot is saved before that slot is released. Already-running calls can still consume more quota. Quota-skipped implementers reuse their existing worktrees and call history when resumed; retries are not treated as completed dependencies by the scheduler. Plan validation requires positive integer parallelism and timeouts, nonnegative integer repair counts, and a finite quota threshold above 0 and at most 100.
 
 ## Accounting
 

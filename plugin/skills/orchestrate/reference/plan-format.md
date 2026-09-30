@@ -8,15 +8,15 @@ Decisions every worker must share: conventions, chosen approach, names, things n
 Workers see this, the goal, and a one-line list of the other tasks.
 """
 checks = ["npm test --silent", "npm run lint"]   # run in each implementer's worktree after it finishes
-max_parallel = 3           # concurrent Codex processes (default 3)
-quota_stop = 90            # don't start new Codex calls once a Codex limit window is at this % (default 90)
+max_parallel = 3           # positive integer: concurrent Codex processes (default 3)
+quota_stop = 90            # number > 0 and <= 100: stop new calls at this limit % (default 90)
 base = "HEAD"              # where worktrees branch from (default HEAD; commit your changes first)
 
 [defaults]                 # optional
 model = "gpt-6.1-sol"
 implementer_effort = "high"   # also explorer_effort, reviewer_effort
-max_repairs = 1               # automatic repair rounds after failed checks or verification
-timeout_min = 30
+max_repairs = 1               # nonnegative integer: automatic repair rounds
+timeout_min = 30              # positive integer
 network = false               # let implementers use the network (e.g. package installs)
 
 [[task]]
@@ -65,6 +65,9 @@ How a task runs:
   - `uncertain`: the verifier couldn't decide; the lead decides
   - `blocked`: the worker stopped and asked something (see its open questions); answer with `orc steer`
   - `error`: Codex failed (missing, timed out, no valid output)
+  - `stale`: an upstream task was steered after this task ran; merge the updated upstream task and write a new plan for this work. Its old branch is preserved; even an explicit merge cannot bypass stale dependencies.
   - `skipped`: a dependency didn't succeed, or the Codex quota guard stopped it; `orc resume <run>` runs skipped tasks later
 - A read-only task that comes after an implementer (directly or through other read-only tasks) runs in that implementer's worktree, so it sees the new code. An implementer that comes after one branches from its branch.
+- A failed worker, repair, or steer cannot pass on the strength of final JSON alone. Partial implementation work is committed for recovery. A verifier execution error produces `uncertain`, even if its final JSON says `pass`.
+- `resume` reuses a quota-skipped implementer's existing worktree and call history. Partial merges retain branches and worktrees while unfinished tasks still need them. Merge refuses to run during another Git operation and leaves dirty worktrees available for inspection.
 - Checks run on your machine, outside Codex's sandbox, on code a worker wrote. Only use `checks` you would run yourself on an untrusted branch.
