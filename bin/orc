@@ -1,0 +1,1108 @@
+#!/usr/bin/env python3
+"""orc: run OpenAI Codex workers for a Claude Code orchestrator.
+
+Claude (the lead) writes a plan.toml. orc runs it: Codex workers in git worktrees,
+deterministic checks, an independent verifier, and a bounded repair loop. It then
+prints a compact summary, and `orc report` shows tokens, API-equivalent cost and
+usage-limit percentages for both Codex and Claude.
+
+Standard library only (Python 3.11+). See README.md and docs/design.md.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import datetime as dt
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PROMPTS = ROOT / "prompts"
+SCHEMAS = ROOT / "schemas"
+PRICING = ROOT / "pricing.toml"
+ORC_HOME = Path(os.environ.get("ORC_HOME", Path.home() / ".orc"))
+CODEX = os.environ.get("ORC_CODEX_BIN", "codex")
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+
+DEFAULT_MODEL = "gpt-6.1-sol"
+EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+ROLES = {
+    "explorer":    {"sandbox": "read-only",       "writes": False, "effort": "medium"},
+    "reviewer":    {"sandbox": "read-only",       "writes": False, "effort": "high"},
+    "implementer": {"sandbox": "workspace-write", "writes": True,  "effort": "high"},
+}
+VERIFY_LEVELS = ("none", "checks", "codex", "codex+adversary")
+VERIFY_BY_RISK = {"low": "checks", "medium": "codex", "high": "codex+adversary"}
+USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+
+
+# ---------------------------------------------------------------- utilities
+
+def die(msg: str, code: int = 1):
+    print(f"orc: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(cmd: list[str], cwd=None, check=True) -> str:
+    p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd)} failed: {p.stderr.strip() or p.stdout.strip()}")
+    return p.stdout.strip()
+
+
+def git(*args, cwd=None, check=True) -> str:
+    return sh(["git", *args], cwd=cwd, check=check)
+
+
+def now_iso() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def fmt_tok(n: float) -> str:
+    n = n or 0
+    if n >= 1e6:
+        return f"{n / 1e6:.2f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}k"
+    return str(int(n))
+
+
+def fmt_secs(s: float) -> str:
+    s = int(s or 0)
+    return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def clip(text: str, n: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def tail(text: str, lines: int = 25) -> str:
+    return "\n".join((text or "").rstrip().splitlines()[-lines:])
+
+
+def write_json(path: Path, data) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def read_json(path: Path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def add_usage(a: dict, b: dict) -> dict:
+    return {k: (a.get(k) or 0) + (b.get(k) or 0) for k in USAGE_KEYS}
+
+
+# ---------------------------------------------------------------- pricing
+
+def load_pricing() -> dict:
+    try:
+        return tomllib.loads(PRICING.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def openai_cost(model: str, u: dict, pricing: dict) -> float:
+    table = pricing.get("openai", {})
+    p = table.get(model) or table.get("default") or {"input": 2.0, "cached_input": 0.1, "output": 10.0}
+    cached = u.get("cached_input_tokens") or 0
+    fresh = max((u.get("input_tokens") or 0) - cached, 0)
+    # OpenAI convention: input_tokens includes cached tokens; output_tokens includes reasoning tokens.
+    return (fresh * p["input"] + cached * p["cached_input"] + (u.get("output_tokens") or 0) * p["output"]) / 1e6
+
+
+def anthropic_cost(model: str, u: dict, pricing: dict) -> float:
+    table = pricing.get("anthropic", {})
+    p = table.get(model) or table.get("default") or {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0}
+    return (u.get("input_tokens", 0) * p["input"] + u.get("cache_creation_input_tokens", 0) * p["cache_write"]
+            + u.get("cache_read_input_tokens", 0) * p["cache_read"] + u.get("output_tokens", 0) * p["output"]) / 1e6
+
+
+# ---------------------------------------------------------------- usage limits
+
+def _find_key(obj, key):
+    if isinstance(obj, dict):
+        if obj.get(key):
+            return obj[key]
+        for v in obj.values():
+            r = _find_key(v, key)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_key(v, key)
+            if r:
+                return r
+    return None
+
+
+def _limits_in_rollout(path: Path):
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if '"rate_limits"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        rl = _find_key(ev, "rate_limits")
+        if rl:
+            return {"rate_limits": rl, "at": ev.get("timestamp") or dt.datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat()}
+    return None
+
+
+def recent_rollouts(limit: int = 8) -> list[Path]:
+    base = CODEX_HOME / "sessions"
+    files: list[Path] = []
+    try:
+        for y in sorted(base.iterdir(), reverse=True):
+            for m in sorted(y.iterdir(), reverse=True):
+                for d in sorted(m.iterdir(), reverse=True):
+                    files += d.glob("rollout-*.jsonl")
+                    if len(files) >= limit:
+                        raise StopIteration
+    except (OSError, StopIteration):
+        pass
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+
+
+def codex_limits(thread_id: str | None = None):
+    """Latest Codex rate-limit snapshot, from the rollout of `thread_id` or the newest rollouts.
+
+    `codex exec --json` does not reliably carry rate limits, but every rollout file under
+    $CODEX_HOME/sessions logs `token_count` events that do."""
+    paths = list((CODEX_HOME / "sessions").glob(f"*/*/*/rollout-*{thread_id}.jsonl")) if thread_id else []
+    for p in paths + recent_rollouts():
+        snap = _limits_in_rollout(p)
+        if snap:
+            return snap
+    return None
+
+
+def save_codex_limits(snap) -> None:
+    if snap:
+        ORC_HOME.mkdir(parents=True, exist_ok=True)
+        write_json(ORC_HOME / "codex-limits.json", snap)
+
+
+def codex_windows(snap) -> dict:
+    """{'5h': (pct, resets_at_epoch|None), 'wk': ...} from a Codex rate_limits snapshot."""
+    out = {}
+    if not snap:
+        return out
+    rl = snap.get("rate_limits") or {}
+    for slot in ("primary", "secondary"):
+        w = rl.get(slot)
+        if not isinstance(w, dict) or w.get("used_percent") is None:
+            continue
+        mins = w.get("window_minutes") or 0
+        label = {300: "5h", 10080: "wk"}.get(mins, f"{mins}m" if mins < 1440 else f"{mins // 1440}d")
+        resets = w.get("resets_at")
+        if resets is None and w.get("resets_in_seconds") is not None:
+            try:
+                resets = dt.datetime.fromisoformat(snap["at"].replace("Z", "+00:00")).timestamp() + w["resets_in_seconds"]
+            except (KeyError, ValueError):
+                resets = None
+        out[label] = (float(w["used_percent"]), resets)
+    return out
+
+
+def claude_windows(snap) -> dict:
+    out = {}
+    rl = (snap or {}).get("rate_limits") or {}
+    for key, label in (("five_hour", "5h"), ("seven_day", "wk")):
+        w = rl.get(key)
+        if isinstance(w, dict) and w.get("used_percentage") is not None:
+            out[label] = (float(w["used_percentage"]), w.get("resets_at"))
+    return out
+
+
+def fmt_windows(now: dict, start: dict | None = None) -> str:
+    if not now:
+        return "limits n/a"
+    parts = []
+    for label, (pct, resets) in now.items():
+        s = f"{label} {pct:.0f}%"
+        if start and label in start:
+            before = start[label][0]
+            s = f"{label} {before:.0f}% → {pct:.0f}%" if pct >= before else f"{label} {pct:.0f}% (window reset)"
+        if resets and label == "5h":
+            s += f" (resets {dt.datetime.fromtimestamp(float(resets)).strftime('%H:%M')})"
+        parts.append(s)
+    return ", ".join(parts)
+
+
+# ---------------------------------------------------------------- Claude session data
+
+def claude_snapshot(cwd: Path | None = None):
+    """Newest statusline snapshot written by `orc statusline`, preferring one for this project."""
+    d = ORC_HOME / "claude"
+    if os.environ.get("ORC_CLAUDE_SESSION"):
+        return read_json(d / f"{os.environ['ORC_CLAUDE_SESSION']}.json")
+    snaps = sorted(d.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True) if d.is_dir() else []
+    cwd = str((cwd or Path.cwd()).resolve())
+    loaded = [s for s in (read_json(p) for p in snaps[:20]) if s]
+    for s in loaded:
+        ws = s.get("workspace") or {}
+        if cwd in (ws.get("project_dir"), ws.get("current_dir"), s.get("cwd")):
+            return s
+    return loaded[0] if loaded else None
+
+
+def claude_tokens(transcript: str | None) -> dict:
+    """Sum assistant-message usage in a Claude Code transcript (plus its subagent transcripts)."""
+    tot = {"input_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 0}
+    models: dict[str, int] = {}
+    if not transcript or not Path(transcript).exists():
+        return {"usage": tot, "models": models}
+    files = [Path(transcript)] + sorted(Path(transcript[:-6] if transcript.endswith(".jsonl") else transcript).glob("subagents/*.jsonl"))
+    seen = set()
+    for f in files:
+        try:
+            lines = f.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if '"usage"' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            msg = ev.get("message") or {}
+            u = msg.get("usage")
+            if ev.get("type") != "assistant" or not u:
+                continue
+            key = (msg.get("id"), ev.get("requestId"))
+            if key in seen:
+                continue
+            seen.add(key)
+            for k in tot:
+                tot[k] += u.get(k) or 0
+            m = msg.get("model") or "unknown"
+            models[m] = models.get(m, 0) + 1
+    return {"usage": tot, "models": models}
+
+
+# ---------------------------------------------------------------- plan
+
+def load_plan(path: str) -> tuple[dict, list[str], list[str]]:
+    """Parse and validate a plan. Returns (plan, errors, warnings)."""
+    try:
+        plan = tomllib.loads(Path(path).read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return {}, [f"cannot read plan: {e}"], []
+    errs, warns = [], []
+    plan.setdefault("goal", "")
+    risk = plan.setdefault("risk", "medium")
+    if risk not in VERIFY_BY_RISK:
+        errs.append(f"risk must be low|medium|high, got {risk!r}")
+        risk = "medium"
+    defaults = plan.get("defaults", {})
+    tasks = plan.get("task", [])
+    if not plan["goal"].strip():
+        errs.append("plan needs a `goal`")
+    if not tasks:
+        errs.append("plan has no [[task]] entries")
+    ids: set[str] = set()
+    for t in tasks:
+        tid = t.get("id", "")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", tid):
+            errs.append(f"task id {tid!r}: use lowercase-kebab, max 40 chars")
+        if tid in ids:
+            errs.append(f"duplicate task id {tid!r}")
+        ids.add(tid)
+        role = t.get("role")
+        if role not in ROLES:
+            errs.append(f"{tid}: role must be one of {', '.join(ROLES)}")
+            continue
+        for field in ("brief", "why"):
+            if not str(t.get(field, "")).strip():
+                errs.append(f"{tid}: missing `{field}`")
+        t["writes"] = ROLES[role]["writes"]
+        t["sandbox"] = ROLES[role]["sandbox"]
+        t["model"] = t.get("model") or defaults.get("model") or DEFAULT_MODEL
+        t["effort"] = t.get("effort") or defaults.get(f"{role}_effort") or ROLES[role]["effort"]
+        if t["effort"] not in EFFORTS:
+            errs.append(f"{tid}: effort must be one of {', '.join(EFFORTS)}")
+        t["verify"] = t.get("verify") or (VERIFY_BY_RISK[risk] if t["writes"] else "none")
+        if t["verify"] not in VERIFY_LEVELS:
+            errs.append(f"{tid}: verify must be one of {', '.join(VERIFY_LEVELS)}")
+        t["acceptance"] = list(t.get("acceptance", []))
+        if t["writes"] and not t["acceptance"]:
+            errs.append(f"{tid}: implementer tasks need `acceptance` criteria (the verifier checks them)")
+        t["after"] = list(t.get("after", []))
+        t["files"] = list(t.get("files", []))
+        t["checks"] = list(plan.get("checks", [])) + list(t.get("checks", []))
+        t["network"] = bool(t.get("network", defaults.get("network", False)))
+        t["timeout_min"] = int(t.get("timeout_min", defaults.get("timeout_min", 30)))
+        t["max_repairs"] = int(t.get("max_repairs", defaults.get("max_repairs", 1)))
+        if t["writes"] and t["verify"] != "none" and not t["checks"]:
+            warns.append(f"{tid}: no `checks`; add at least a test or build command so verification has hard evidence")
+    by_id = {t.get("id"): t for t in tasks}
+    for t in tasks:
+        for d in t.get("after", []):
+            if d not in by_id:
+                errs.append(f"{t.get('id')}: `after` names unknown task {d!r}")
+    if errs:
+        return plan, errs, warns
+    order = topo_order(tasks)
+    if order is None:
+        return plan, ["tasks have a dependency cycle"], warns
+    anc = ancestors(tasks)
+    writers = [t for t in tasks if t["writes"]]
+    for t in writers:
+        parents = [d for d in t["after"] if by_id[d]["writes"]]
+        if len(parents) > 1:
+            errs.append(f"{t['id']}: an implementer may build on at most one other implementer ({', '.join(parents)}); merge them first or split the plan")
+    for i, a in enumerate(writers):
+        for b in writers[i + 1:]:
+            if a["id"] in anc[b["id"]] or b["id"] in anc[a["id"]]:
+                continue
+            if not a["files"] or not b["files"]:
+                errs.append(f"{a['id']} and {b['id']} can run in parallel and both write: declare disjoint `files` for each, or order them with `after`")
+            elif (hit := files_overlap(a["files"], b["files"])):
+                errs.append(f"{a['id']} and {b['id']} write overlapping files ({hit[0]} vs {hit[1]}): make them disjoint or order them with `after`")
+    plan["task"] = order
+    return plan, errs, warns
+
+
+def topo_order(tasks: list[dict]):
+    by_id = {t["id"]: t for t in tasks}
+    done, out = set(), []
+    pending = list(tasks)
+    while pending:
+        ready = [t for t in pending if all(d in done for d in t["after"])]
+        if not ready:
+            return None
+        for t in ready:
+            done.add(t["id"])
+            out.append(by_id[t["id"]])
+            pending.remove(t)
+    return out
+
+
+def ancestors(tasks: list[dict]) -> dict[str, set]:
+    by_id = {t["id"]: t for t in tasks}
+    memo: dict[str, set] = {}
+
+    def walk(tid):
+        if tid not in memo:
+            memo[tid] = set()
+            for d in by_id[tid]["after"]:
+                memo[tid] |= {d} | walk(d)
+        return memo[tid]
+
+    for t in tasks:
+        walk(t["id"])
+    return memo
+
+
+def files_overlap(a: list[str], b: list[str]):
+    for x in a:
+        for y in b:
+            xs, ys = x.split("*")[0].rstrip("/"), y.split("*")[0].rstrip("/")
+            if fnmatch.fnmatch(x, y) or fnmatch.fnmatch(y, x) or xs.startswith(ys) or ys.startswith(xs):
+                return x, y
+    return None
+
+
+def verify_label(t: dict) -> str:
+    if not t["writes"] or t["verify"] == "none":
+        return "none (lead reads result)" if not t["writes"] else "none"
+    parts = [f"{len(t['checks'])} check{'s' if len(t['checks']) != 1 else ''}"] if t["checks"] else []
+    parts += {"codex": ["verifier"], "codex+adversary": ["verifier", "adversary"]}.get(t["verify"], [])
+    return " + ".join(parts) or "none"
+
+
+def shortstat(s: str) -> str:
+    """'3 files changed, 10 insertions(+), 2 deletions(-)' -> '3 files +10/-2'."""
+    f = re.search(r"(\d+) files? changed", s or "")
+    i = re.search(r"(\d+) insertion", s or "")
+    d = re.search(r"(\d+) deletion", s or "")
+    return f"{f.group(1) if f else 0} files +{i.group(1) if i else 0}/-{d.group(1) if d else 0}" if s else ""
+
+
+def codex_call_estimate(plan: dict) -> tuple[int, int]:
+    low = high = 0
+    for t in plan["task"]:
+        per = 1 + {"codex": 1, "codex+adversary": 2}.get(t["verify"], 0)
+        low += per
+        high += per + t["max_repairs"] * per if t["writes"] else per
+    return low, high
+
+
+def render_plan(plan: dict) -> str:
+    rows = ["| # | task | role · effort | after | verification | why |", "|---|---|---|---|---|---|"]
+    for i, t in enumerate(plan["task"], 1):
+        rows.append(f"| {i} | {t['id']} | {t['role']} · {t['effort']} | {', '.join(t['after']) or '-'} | "
+                    f"{verify_label(t)} | {clip(t['why'], 90)} |")
+    lo, hi = codex_call_estimate(plan)
+    lines = [f"**Plan:** {plan['goal']}  (risk: {plan['risk']}, max parallel: {plan.get('max_parallel', 3)})", "", *rows, "",
+             f"Codex calls: {lo} (up to {hi} with repairs) on {plan['task'][0]['model']}. "
+             f"Codex {fmt_windows(codex_windows(codex_limits()))} · Claude {fmt_windows(claude_windows(claude_snapshot()))}"]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- codex execution
+
+class Run:
+    def __init__(self, plan: dict, repo: Path | None, run_dir: Path, run_id: str, base: str | None):
+        self.plan, self.repo, self.dir, self.id, self.base = plan, repo, run_dir, run_id, base
+        self.pricing = load_pricing()
+        self.lock = threading.Lock()
+        self.slots = threading.Semaphore(int(plan.get("max_parallel", 3)))
+        self.quota_stop = float(plan.get("quota_stop", 90))
+        self.state = read_json(run_dir / "state.json") or {}
+
+    def save(self):
+        with self.lock:
+            for _ in range(5):  # worker threads may mutate task records mid-dump; retry
+                try:
+                    write_json(self.dir / "state.json", self.state)
+                    return
+                except RuntimeError:
+                    time.sleep(0.05)
+
+    def log(self, msg: str):
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+    def quota_blocked(self) -> str | None:
+        for label, (pct, _) in codex_windows(read_json(ORC_HOME / "codex-limits.json")).items():
+            if pct >= self.quota_stop:
+                return f"Codex {label} limit at {pct:.0f}% (quota_stop={self.quota_stop:.0f})"
+        return None
+
+    def codex(self, task: dict, name: str, prompt: str, schema: str, cwd: Path, sandbox: str,
+              resume: str | None = None, effort: str | None = None) -> dict:
+        """Run one `codex exec` call; return a call record (thread, usage, parsed final JSON)."""
+        tdir = self.dir / task["id"]
+        out = tdir / f"{name}.final.json"
+        cmd = [CODEX, "exec", "--json", "-o", str(out), "--output-schema", str(SCHEMAS / f"{schema}.schema.json"),
+               "-m", task["model"], "-c", f'model_reasoning_effort="{effort or task["effort"]}"',
+               "-s", sandbox, "-C", str(cwd), "--skip-git-repo-check"]
+        if sandbox == "workspace-write" and task["network"]:
+            cmd += ["-c", "sandbox_workspace_write.network_access=true"]
+        if resume:
+            cmd += ["resume", resume]
+        cmd.append("-")
+        (tdir / f"{name}.prompt.md").write_text(prompt)
+        rec = {"name": name, "thread": None, "usage": {k: 0 for k in USAGE_KEYS}, "final": None, "error": None,
+               "effort": effort or task["effort"], "model": task["model"]}
+        if (why := self.quota_blocked()):
+            rec["error"] = f"skipped: {why}"
+            return rec
+        with self.slots:
+            start = time.time()
+            with open(tdir / f"{name}.events.jsonl", "w") as ev, open(tdir / f"{name}.stderr.log", "w") as er:
+                try:
+                    p = subprocess.run(cmd, input=prompt, text=True, stdout=ev, stderr=er, timeout=task["timeout_min"] * 60)
+                    rc = p.returncode
+                except subprocess.TimeoutExpired:
+                    rc = "timeout"
+                except FileNotFoundError:
+                    rc = "codex not found (set ORC_CODEX_BIN or install @openai/codex)"
+            rec["seconds"] = round(time.time() - start, 1)
+        for line in (tdir / f"{name}.events.jsonl").read_text(errors="replace").splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            kind = ev.get("type")
+            if kind == "thread.started":
+                rec["thread"] = ev.get("thread_id")
+            elif kind == "turn.completed":
+                rec["usage"] = add_usage(rec["usage"], ev.get("usage") or {})
+            elif kind in ("turn.failed", "error"):
+                rec["error"] = clip((ev.get("error") or {}).get("message") or ev.get("message") or kind, 300)
+        rec["thread"] = rec["thread"] or resume
+        try:
+            rec["final"] = json.loads(out.read_text())
+        except (OSError, ValueError):
+            if not rec["error"]:
+                rec["error"] = f"exit {rc}; no valid final JSON" + (f": {clip(tail((tdir / f'{name}.stderr.log').read_text(), 3), 300)}" if rc else "")
+        if rc not in (0, None) and not rec["error"]:
+            rec["error"] = f"exit {rc}"
+        rec["cost"] = round(openai_cost(task["model"], rec["usage"], self.pricing), 4)
+        save_codex_limits(codex_limits(rec["thread"]))
+        return rec
+
+    # ------------------------------------------------------------ prompts
+
+    def worker_prompt(self, t: dict) -> str:
+        parts = [(PROMPTS / f"{t['role']}.md").read_text().strip(), f"## Team goal\n{self.plan['goal']}"]
+        if self.plan.get("context"):
+            parts.append(f"## Shared context and decisions (binding for every worker)\n{self.plan['context'].strip()}")
+        others = [f"- {o['id']} ({o['role']}): {o['why']}" for o in self.plan["task"] if o["id"] != t["id"]]
+        if others:
+            parts.append("## Other tasks in this plan (context only; do not do them)\n" + "\n".join(others))
+        for d in t["after"]:
+            res = (self.state.get("tasks", {}).get(d) or {}).get("result") or {}
+            if res:
+                block = [f"## Input from `{d}`", res.get("summary", "")]
+                block += [f"- {f}" for f in res.get("findings", [])]
+                block += [f"- changed {c['path']}: {c['what']}" for c in res.get("changes", [])]
+                parts.append("\n".join(block))
+        parts.append(f"## Your task: {t['id']}\n{t['brief'].strip()}")
+        if t["acceptance"]:
+            parts.append("## Acceptance criteria\n" + "\n".join(f"{i}. {a}" for i, a in enumerate(t["acceptance"], 1)))
+        if t["writes"] and t["files"]:
+            parts.append("## Files you own\n" + "\n".join(f"- {f}" for f in t["files"]))
+        if t["writes"] and t["checks"]:
+            parts.append("## Checks the harness runs after you (make them pass)\n" + "\n".join(f"- `{c}`" for c in t["checks"]))
+        return "\n\n".join(parts) + "\n"
+
+    def review_prompt(self, t: dict, kind: str, base: str, rec: dict) -> str:
+        res = rec.get("result") or {}
+        parts = [(PROMPTS / f"{kind}.md").read_text().strip().replace("{base}", base),
+                 f"## Goal of the change\n{self.plan['goal']}", f"## Task given to the implementer\n{t['brief'].strip()}"]
+        if self.plan.get("context"):
+            parts.append(f"## Shared context and decisions\n{self.plan['context'].strip()}")
+        if t["acceptance"]:
+            parts.append("## Acceptance criteria\n" + "\n".join(f"{i}. {a}" for i, a in enumerate(t["acceptance"], 1)))
+        if res.get("claims"):
+            parts.append("## Implementer's claims (check them, do not trust them)\n" + "\n".join(f"- {c}" for c in res["claims"]))
+        if rec.get("checks"):
+            parts.append("## Deterministic checks already run by the harness\n" + "\n".join(
+                f"- `{c['cmd']}` → exit {c['exit']}" for c in rec["checks"]))
+        return "\n\n".join(parts) + "\n"
+
+    # ------------------------------------------------------------ task pipeline
+
+    def run_checks(self, t: dict, cwd: Path, round_no: int) -> list[dict]:
+        results, log = [], []
+        for cmd in t["checks"]:
+            try:
+                p = subprocess.run(cmd, shell=True, cwd=cwd, text=True, capture_output=True, timeout=900)
+                code, out = p.returncode, (p.stdout or "") + (p.stderr or "")
+            except subprocess.TimeoutExpired:
+                code, out = "timeout", "check timed out after 15 minutes"
+            results.append({"cmd": cmd, "exit": code, "tail": tail(out, 25)})
+            log.append(f"$ {cmd}\n[exit {code}]\n{out}\n")
+        (self.dir / t["id"] / f"checks.{round_no}.log").write_text("\n".join(log))
+        return results
+
+    def commit(self, t: dict, wt: Path, msg: str) -> None:
+        git("add", "-A", cwd=wt)
+        if git("status", "--porcelain", cwd=wt):
+            git("-c", "user.name=orc", "-c", "user.email=orc@localhost", "commit", "-q", "-m", msg, cwd=wt)
+
+    def verify(self, t: dict, rec: dict, wt: Path, base: str) -> list[dict]:
+        kinds = {"codex": ["verifier"], "codex+adversary": ["verifier", "adversary"]}.get(t["verify"], [])
+        n = len(rec["calls"])
+        with cf.ThreadPoolExecutor(len(kinds) or 1) as ex:
+            futs = [ex.submit(self.codex, t, f"{k}{n}", self.review_prompt(t, k, base, rec), "verdict", wt, "read-only",
+                              effort="xhigh" if k == "adversary" else t.get("verify_effort", "high")) for k in kinds]
+            calls = [f.result() for f in futs]
+        rec["calls"] += calls
+        return calls
+
+    def run_task(self, t: dict) -> dict:
+        tdir = self.dir / t["id"]
+        tdir.mkdir(parents=True, exist_ok=True)
+        rec = {"id": t["id"], "role": t["role"], "effort": t["effort"], "model": t["model"], "verify": t["verify"],
+               "status": "running", "calls": [], "started": now_iso()}
+        self.state["tasks"][t["id"]] = rec
+        self.save()
+        self.log(f"▶ {t['id']} ({t['role']}, {t['effort']})")
+        try:
+            if t["writes"]:
+                self.implement(t, rec, tdir)
+            else:
+                call = self.codex(t, "worker", self.worker_prompt(t), "worker-result", self.repo or Path.cwd(), "read-only")
+                rec["calls"].append(call)
+                rec["result"] = call["final"]
+                rec["status"] = call["final"]["status"] if call["final"] else "error"
+                rec["error"] = call["error"] if not call["final"] else None
+        except Exception as e:  # keep other tasks running
+            rec["status"], rec["error"] = "error", f"{type(e).__name__}: {e}"
+        rec["finished"] = now_iso()
+        self.save()
+        self.log(f"■ {t['id']}: {rec['status']}")
+        return rec
+
+    def implement(self, t: dict, rec: dict, tdir: Path) -> None:
+        tasks = self.state["tasks"]
+        parent = next((d for d in t["after"] if tasks.get(d, {}).get("branch")), None)
+        start_ref = tasks[parent]["branch"] if parent else self.base
+        branch = f"orc/{self.id}/{t['id']}"
+        wt = ORC_HOME / "worktrees" / f"{self.repo.name}-{self.id}" / t["id"]
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        git("worktree", "add", "-q", "-b", branch, str(wt), start_ref, cwd=self.repo)
+        base = git("rev-parse", start_ref, cwd=self.repo)
+        rec.update(branch=branch, worktree=str(wt), base=base)
+        self.save()
+
+        call = self.codex(t, "worker", self.worker_prompt(t), "worker-result", wt, "workspace-write")
+        rec["calls"].append(call)
+        rec["result"], thread = call["final"], call["thread"]
+        if not call["final"]:
+            rec["status"], rec["error"] = "error", call["error"]
+            return
+        for round_no in range(t["max_repairs"] + 1):
+            self.commit(t, wt, f"orc({t['id']}): round {round_no}")
+            rec["checks"] = self.run_checks(t, wt, round_no)
+            failed = [c for c in rec["checks"] if c["exit"] != 0]
+            verdicts = [] if failed else self.verify(t, rec, wt, base)
+            rec["verdicts"] = [{"kind": v["name"], **(v["final"] or {"verdict": "uncertain", "summary": v["error"] or "no verdict", "issues": [], "criteria": []})} for v in verdicts]
+            bad = [v for v in rec["verdicts"] if v["verdict"] != "pass"]
+            if not failed and not bad:
+                rec["status"] = "verified" if verdicts else ("checks-passed" if t["checks"] else "unverified")
+                break
+            if not failed and all(v["verdict"] == "uncertain" for v in bad):
+                rec["status"] = "uncertain"  # a repair can't fix what the verifier couldn't check; the lead decides
+                break
+            rec["status"] = "failed"
+            if round_no == t["max_repairs"] or not thread:
+                break
+            feedback = self.repair_feedback(failed, bad)
+            call = self.codex(t, f"repair{round_no + 1}", feedback, "worker-result", wt, "workspace-write", resume=thread)
+            rec["calls"].append(call)
+            if call["final"]:
+                rec["result"] = call["final"]
+            else:
+                rec["error"] = call["error"]
+                break
+        rec["diffstat"] = git("diff", "--shortstat", base, "HEAD", cwd=wt, check=False)
+
+    def repair_feedback(self, failed: list[dict], bad: list[dict]) -> str:
+        parts = ["Your change did not pass review. Fix the problems below in the same worktree, re-run the checks, "
+                 "and reply with the same JSON schema describing the final state (all changes so far, not just this round)."]
+        for c in failed:
+            parts.append(f"## Failing check: `{c['cmd']}` (exit {c['exit']})\n```\n{c['tail']}\n```")
+        for v in bad:
+            items = [f"- [{i['severity']}] {i['location']}: {i['problem']}" for i in v.get("issues", [])]
+            items += [f"- unmet criterion: {c['criterion']} ({c['evidence']})" for c in v.get("criteria", []) if c.get("met") == "no"]
+            parts.append(f"## {v['kind']} verdict: {v['verdict']}\n{v.get('summary', '')}\n" + "\n".join(items))
+        return "\n\n".join(parts) + "\n"
+
+    # ------------------------------------------------------------ scheduling
+
+    def execute(self, only: set[str] | None = None) -> None:
+        tasks = [t for t in self.plan["task"] if not only or t["id"] in only]
+        self.state.setdefault("tasks", {})
+        done: set[str] = {tid for tid, r in self.state["tasks"].items() if r.get("status") in ("done", "verified", "checks-passed", "unverified")}
+        pending = {t["id"]: t for t in tasks if t["id"] not in done}
+        running: dict[cf.Future, str] = {}
+        finished = set(self.state["tasks"])  # judge a dependency only once it has finished (statuses change mid-repair)
+        with cf.ThreadPoolExecutor(max(len(pending), 1)) as ex:
+            while pending or running:
+                for tid, t in list(pending.items()):
+                    deps = [self.state["tasks"][d]["status"] for d in t["after"] if d in finished]
+                    if any(s in ("error", "failed", "blocked", "skipped", "uncertain") for s in deps):
+                        self.state["tasks"][tid] = {"id": tid, "role": t["role"], "status": "skipped", "calls": [],
+                                                    "error": "a dependency did not succeed"}
+                        finished.add(tid)
+                        del pending[tid]
+                    elif all(d in done for d in t["after"]):
+                        running[ex.submit(self.run_task, t)] = tid
+                        del pending[tid]
+                if not running:
+                    if pending:  # unreachable dependencies (e.g. filtered by --only)
+                        for tid in pending:
+                            self.state["tasks"][tid] = {"id": tid, "status": "skipped", "calls": [], "error": "dependency not run"}
+                    break
+                fin, _ = cf.wait(running, return_when=cf.FIRST_COMPLETED)
+                for f in fin:
+                    tid = running.pop(f)
+                    finished.add(tid)
+                    if f.result()["status"] in ("done", "partial", "verified", "checks-passed", "unverified"):
+                        done.add(tid)
+        self.save()
+
+
+# ---------------------------------------------------------------- summaries
+
+OK_STATUSES = ("done", "verified", "checks-passed")
+
+
+def task_line(r: dict) -> list[str]:
+    mark = "✓" if r["status"] in OK_STATUSES else ("~" if r["status"] in ("partial", "uncertain", "unverified") else "✗")
+    usage = {k: 0 for k in USAGE_KEYS}
+    for c in r.get("calls", []):
+        usage = add_usage(usage, c.get("usage") or {})
+    cost = sum(c.get("cost") or 0 for c in r.get("calls", []))
+    secs = sum(c.get("seconds") or 0 for c in r.get("calls", []))
+    bits = [f"{mark} {r['id']} [{r.get('role', '?')}·{r.get('effort', '?')}] {r['status']}"]
+    if r.get("checks"):
+        bits.append(f"checks {sum(c['exit'] == 0 for c in r['checks'])}/{len(r['checks'])}")
+    if r.get("verdicts"):
+        bits.append("/".join(f"{v['kind'].rstrip('0123456789')} {v['verdict']}" for v in r["verdicts"]))
+    repairs = sum(c["name"].startswith("repair") for c in r.get("calls", []))
+    if repairs:
+        bits.append(f"repaired {repairs}x")
+    if r.get("diffstat"):
+        bits.append(shortstat(r["diffstat"]))
+    bits.append(f"{len(r.get('calls', []))} calls · {fmt_tok(usage['input_tokens'] + usage['output_tokens'])} tok · ≈${cost:.2f} · {fmt_secs(secs)}")
+    lines = [" · ".join(bits)]
+    res = r.get("result") or {}
+    if res.get("summary"):
+        lines.append(f"   {clip(res['summary'], 400)}")
+    if r.get("role") in ("explorer", "reviewer"):
+        lines += [f"   - {clip(f, 240)}" for f in res.get("findings", [])[:10]]
+        if len(res.get("findings", [])) > 10:
+            lines.append(f"   … {len(res['findings']) - 10} more in result")
+    for v in r.get("verdicts", []):
+        for i in v.get("issues", [])[:5]:
+            lines.append(f"   ! [{i['severity']}] {clip(i['location'], 60)}: {clip(i['problem'], 200)}")
+        if v["verdict"] == "uncertain":
+            lines.append(f"   ? {clip(v.get('summary', ''), 240)}")
+    for c in r.get("checks", []):
+        if c["exit"] != 0:
+            lines.append(f"   ✗ `{c['cmd']}` exit {c['exit']}: {clip(tail(c['tail'], 3), 240)}")
+    for q in res.get("open_questions", [])[:3]:
+        lines.append(f"   ? {clip(q, 240)}")
+    if r.get("error"):
+        lines.append(f"   error: {clip(r['error'], 300)}")
+    if r.get("branch"):
+        lines.append(f"   branch {r['branch']}")
+    return lines
+
+
+def run_summary(run_dir: Path, state: dict) -> str:
+    tasks = state.get("tasks", {})
+    out = [f"orc run {state['id']} — {state['goal']}", ""]
+    for tid in state["order"]:
+        if tid in tasks:
+            out += task_line(tasks[tid])
+    calls = [c for r in tasks.values() for c in r.get("calls", [])]
+    usage = {k: 0 for k in USAGE_KEYS}
+    for c in calls:
+        usage = add_usage(usage, c.get("usage") or {})
+    cost = sum(c.get("cost") or 0 for c in calls)
+    out += ["", f"Codex: {len(calls)} calls · {fmt_tok(usage['input_tokens'])} in ({fmt_tok(usage['cached_input_tokens'])} cached) / "
+                f"{fmt_tok(usage['output_tokens'])} out · ≈${cost:.2f} API-equiv · "
+                f"{fmt_windows(codex_windows(read_json(ORC_HOME / 'codex-limits.json')), codex_windows(state.get('codex_start')))}"]
+    ok = [t for t in state["order"] if tasks.get(t, {}).get("status") in ("verified", "checks-passed") and tasks[t].get("branch")]
+    if ok:
+        out.append(f"Next: review the summary above, then `orc merge {state['id']}` to merge {', '.join(ok)}.")
+    if state.get("risk") == "high":
+        out.append("Risk is high: read the diff of each branch before merging (`git diff <base> <branch>`).")
+    out.append(f"Details: {run_dir}/<task>/ (prompts, events, final JSON, check logs)")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- commands
+
+def repo_root() -> Path | None:
+    try:
+        return Path(git("rev-parse", "--show-toplevel"))
+    except RuntimeError:
+        return None
+
+
+def runs_dir(repo: Path | None) -> Path:
+    d = (repo or Path.cwd()) / ".orc" / "runs"
+    d.mkdir(parents=True, exist_ok=True)
+    if repo:
+        exclude = Path(git("rev-parse", "--git-path", "info/exclude", cwd=repo))
+        exclude = exclude if exclude.is_absolute() else repo / exclude
+        if ".orc/" not in (exclude.read_text() if exclude.exists() else ""):
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            with open(exclude, "a") as f:
+                f.write("\n.orc/\n")
+    return d
+
+
+def find_run(repo: Path | None, run_id: str | None) -> Path:
+    d = runs_dir(repo)
+    if run_id:
+        if not (d / run_id / "state.json").exists():
+            die(f"no run {run_id} in {d}")
+        return d / run_id
+    runs = sorted((p for p in d.iterdir() if (p / "state.json").exists()), key=lambda p: p.name)
+    if not runs:
+        die("no runs yet")
+    return runs[-1]
+
+
+def cmd_check(a) -> int:
+    plan, errs, warns = load_plan(a.plan)
+    for w in warns:
+        print(f"warning: {w}")
+    if errs:
+        print("plan is invalid:\n" + "\n".join(f"- {e}" for e in errs))
+        return 1
+    repo = repo_root()
+    if any(t["writes"] for t in plan["task"]):
+        if not repo:
+            print("plan is invalid:\n- implementer tasks need a git repository")
+            return 1
+        dirty = [l for l in git("status", "--porcelain", cwd=repo).splitlines() if not l[3:].startswith(".orc")]
+        if dirty:
+            print(f"warning: {len(dirty)} uncommitted change(s); worktrees start from {plan.get('base', 'HEAD')} and will not see them. Commit first.")
+    print(render_plan(plan))
+    return 0
+
+
+def cmd_run(a) -> int:
+    plan, errs, warns = load_plan(a.plan)
+    if errs:
+        print("plan is invalid:\n" + "\n".join(f"- {e}" for e in errs))
+        return 1
+    repo = repo_root()
+    if any(t["writes"] for t in plan["task"]) and not repo:
+        die("implementer tasks need a git repository")
+    base = git("rev-parse", plan.get("base", "HEAD"), cwd=repo) if repo else None
+    run_id = dt.datetime.now().strftime("%m%d-%H%M%S")
+    run_dir = runs_dir(repo) / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "plan.toml").write_text(Path(a.plan).read_text())
+    codex_start = codex_limits()
+    save_codex_limits(codex_start)
+    claude = claude_snapshot(repo)
+    state = {"id": run_id, "goal": plan["goal"], "risk": plan["risk"], "base": base, "started": now_iso(),
+             "order": [t["id"] for t in plan["task"]], "tasks": {}, "codex_start": codex_start,
+             "claude_session": (claude or {}).get("session_id")}
+    write_json(run_dir / "state.json", state)
+    print(f"orc run {run_id} started ({len(plan['task'])} tasks). Summary follows when all finish.", flush=True)
+    run = Run(plan, repo, run_dir, run_id, base)
+    run.execute(set(a.only.split(",")) if a.only else None)
+    state = run.state
+    state["finished"] = now_iso()
+    write_json(run_dir / "state.json", state)
+    summary = run_summary(run_dir, state)
+    (run_dir / "summary.md").write_text(summary + "\n")
+    print(summary)
+    return 0 if all(r.get("status") in OK_STATUSES for r in state["tasks"].values()) else 2
+
+
+def cmd_steer(a) -> int:
+    repo = repo_root()
+    run_dir = find_run(repo, a.run)
+    state = read_json(run_dir / "state.json")
+    plan, errs, _ = load_plan(run_dir / "plan.toml")
+    t = next((x for x in plan.get("task", []) if x["id"] == a.task), None)
+    rec = state["tasks"].get(a.task)
+    if errs or not t or not rec:
+        die(f"unknown task {a.task} in run {run_dir.name}")
+    thread = next((c["thread"] for c in rec["calls"] if c.get("thread") and c["name"].startswith(("worker", "repair"))), None)
+    if not thread:
+        die("task has no Codex thread to resume")
+    run = Run(plan, repo, run_dir, run_dir.name, state.get("base"))
+    msg = a.message + "\n\nReply with the same JSON schema describing the final state."
+    call = run.codex(t, f"steer{len(rec['calls'])}", msg, "worker-result", Path(rec.get("worktree") or repo or Path.cwd()),
+                     t["sandbox"], resume=thread)
+    rec["calls"].append(call)
+    if call["final"]:
+        rec["result"] = call["final"]
+    if t["writes"] and call["final"]:
+        wt = Path(rec["worktree"])
+        run.commit(t, wt, f"orc({t['id']}): steer")
+        rec["checks"] = run.run_checks(t, wt, len(rec["calls"]))
+        failed = [c for c in rec["checks"] if c["exit"] != 0]
+        verdicts = [] if failed or a.no_verify else run.verify(t, rec, wt, rec["base"])
+        rec["verdicts"] = [{"kind": v["name"], **(v["final"] or {"verdict": "uncertain", "summary": v["error"] or "", "issues": [], "criteria": []})} for v in verdicts]
+        bad = [v for v in rec["verdicts"] if v["verdict"] != "pass"]
+        rec["status"] = "failed" if failed or any(v["verdict"] == "fail" for v in bad) else (
+            "uncertain" if bad else ("verified" if verdicts else "checks-passed"))
+        rec["diffstat"] = git("diff", "--shortstat", rec["base"], "HEAD", cwd=wt, check=False)
+    elif call["final"]:
+        rec["status"] = call["final"]["status"]
+    run.save()
+    print("\n".join(task_line(rec)))
+    return 0 if rec["status"] in OK_STATUSES else 2
+
+
+def cmd_merge(a) -> int:
+    repo = repo_root() or die("not in a git repository")
+    run_dir = find_run(repo, a.run)
+    state = read_json(run_dir / "state.json")
+    want = set(a.tasks) if a.tasks else None
+    merged = []
+    for tid in state["order"]:
+        r = state["tasks"].get(tid, {})
+        if not r.get("branch") or r.get("merged") or (want and tid not in want):
+            continue
+        if not want and r["status"] not in ("verified", "checks-passed"):
+            print(f"skip {tid}: status {r['status']} (name it explicitly to merge anyway)")
+            continue
+        p = subprocess.run(["git", "merge", "--no-ff", "--no-edit", "-m", f"orc: merge {tid} ({state['goal'][:60]})", r["branch"]],
+                           cwd=repo, text=True, capture_output=True)
+        if p.returncode != 0:
+            subprocess.run(["git", "merge", "--abort"], cwd=repo, capture_output=True)
+            print(f"✗ {tid}: merge conflict; aborted. Resolve by hand: git merge {r['branch']}\n{clip(p.stdout + p.stderr, 400)}")
+            break
+        git("worktree", "remove", "--force", r["worktree"], cwd=repo, check=False)
+        git("branch", "-D", r["branch"], cwd=repo, check=False)
+        r["merged"] = now_iso()
+        merged.append(tid)
+    write_json(run_dir / "state.json", state)
+    print(f"merged: {', '.join(merged) or 'nothing'}")
+    return 0
+
+
+def cmd_clean(a) -> int:
+    repo = repo_root() or die("not in a git repository")
+    run_dir = find_run(repo, a.run)
+    state = read_json(run_dir / "state.json")
+    for r in state["tasks"].values():
+        if r.get("worktree") and not r.get("merged"):
+            git("worktree", "remove", "--force", r["worktree"], cwd=repo, check=False)
+            git("branch", "-D", r["branch"], cwd=repo, check=False)
+            r["cleaned"] = now_iso()
+    write_json(run_dir / "state.json", state)
+    print(f"removed worktrees and branches of run {run_dir.name}")
+    return 0
+
+
+def cmd_report(a) -> int:
+    repo = repo_root()
+    d = runs_dir(repo)
+    claude = claude_snapshot(repo)
+    sid = (claude or {}).get("session_id")
+    if a.runs:
+        run_dirs = [find_run(repo, r) for r in a.runs]
+    elif a.all:
+        run_dirs = sorted(p for p in d.iterdir() if (p / "state.json").exists())
+    else:  # every run started from this Claude session, else the latest run
+        all_runs = sorted(p for p in d.iterdir() if (p / "state.json").exists())
+        run_dirs = [p for p in all_runs if sid and read_json(p / "state.json", {}).get("claude_session") == sid] or all_runs[-1:]
+    states = [read_json(p / "state.json") for p in run_dirs]
+    pricing = load_pricing()
+    out = []
+    usage, cost, calls, first_codex = {k: 0 for k in USAGE_KEYS}, 0.0, 0, None
+    if states:
+        out += [f"### Task report — {states[-1]['goal']}", "",
+                "| task | role · effort | result | calls | tokens in (cached) / out | ≈ API $ | time |", "|---|---|---|---|---|---|---|"]
+        for s in states:
+            first_codex = first_codex or s.get("codex_start")
+            for tid in s["order"]:
+                r = s["tasks"].get(tid)
+                if not r:
+                    continue
+                u = {k: 0 for k in USAGE_KEYS}
+                for c in r.get("calls", []):
+                    u = add_usage(u, c.get("usage") or {})
+                c_cost = sum(c.get("cost") or 0 for c in r.get("calls", []))
+                secs = sum(c.get("seconds") or 0 for c in r.get("calls", []))
+                usage, cost, calls = add_usage(usage, u), cost + c_cost, calls + len(r.get("calls", []))
+                out.append(f"| {tid} | {r.get('role', '?')} · {r.get('effort', '?')} | {r['status']}{' (merged)' if r.get('merged') else ''} | "
+                           f"{len(r.get('calls', []))} | {fmt_tok(u['input_tokens'])} ({fmt_tok(u['cached_input_tokens'])}) / {fmt_tok(u['output_tokens'])} | "
+                           f"${c_cost:.2f} | {fmt_secs(secs)} |")
+        model = next((c.get("model") for s in states for r in s["tasks"].values() for c in r.get("calls", []) if c.get("model")), DEFAULT_MODEL)
+        out += ["", f"**Codex ({model}, ChatGPT plan):** {calls} calls · {fmt_tok(usage['input_tokens'] + usage['output_tokens'])} tokens "
+                    f"({fmt_tok(usage['cached_input_tokens'])} cached input, {fmt_tok(usage['output_tokens'])} output) · ≈ ${cost:.2f} API-equivalent · "
+                    f"{fmt_windows(codex_windows(read_json(ORC_HOME / 'codex-limits.json')), codex_windows(first_codex))}"]
+    else:
+        out += ["### Task report (no Codex runs: done by the lead alone)", ""]
+    c_cost = 0.0
+    if claude:
+        tok = claude_tokens(claude.get("transcript_path"))
+        u = tok["usage"]
+        model_id = (claude.get("model") or {}).get("id", "")
+        c_cost = (claude.get("cost") or {}).get("total_cost_usd")
+        if c_cost is None:
+            c_cost = anthropic_cost(model_id, u, pricing)
+        total_in = u["input_tokens"] + u["cache_creation_input_tokens"] + u["cache_read_input_tokens"]
+        out.append(f"**Claude ({(claude.get('model') or {}).get('display_name', model_id or 'lead')}, this session):** "
+                   f"{fmt_tok(total_in + u['output_tokens'])} tokens ({fmt_tok(u['cache_read_input_tokens'])} cache reads, "
+                   f"{fmt_tok(u['output_tokens'])} output) · ≈ ${c_cost:.2f} API-equivalent · "
+                   f"{fmt_windows(claude_windows(claude), claude_windows(claude.get('first')))}")
+    else:
+        out.append("**Claude:** no statusline snapshot found; set `orc statusline` as the status line command (see README).")
+    out.append(f"**Total ≈ ${cost + (c_cost or 0):.2f} API-equivalent** (what these tokens would cost at API list prices; "
+               "subscription usage is shown as limit percentages).")
+    print("\n".join(out))
+    return 0
+
+
+def cmd_statusline(a) -> int:
+    """Claude Code statusLine command: persist the session JSON for `orc report`, print a one-line status."""
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    sid = data.get("session_id")
+    if sid:
+        d = ORC_HOME / "claude"
+        d.mkdir(parents=True, exist_ok=True)
+        prev = read_json(d / f"{sid}.json", {})
+        data["first"] = prev.get("first") or ({"rate_limits": data["rate_limits"]} if data.get("rate_limits") else None)
+        data["saved_at"] = now_iso()
+        write_json(d / f"{sid}.json", data)
+    model = (data.get("model") or {}).get("display_name", "Claude")
+    ctx = (data.get("context_window") or {}).get("used_percentage")
+    cost = (data.get("cost") or {}).get("total_cost_usd")
+    parts = [model]
+    if ctx is not None:
+        parts.append(f"ctx {ctx:.0f}%")
+    cw = claude_windows(data)
+    if cw:
+        parts.append(" ".join(f"{k} {v[0]:.0f}%" for k, v in cw.items()))
+    if cost is not None:
+        parts.append(f"≈${cost:.2f}")
+    xw = codex_windows(read_json(ORC_HOME / "codex-limits.json"))
+    if xw:
+        parts.append("codex " + " ".join(f"{k} {v[0]:.0f}%" for k, v in xw.items()))
+    print(" · ".join(parts))
+    return 0
+
+
+def cmd_doctor(a) -> int:
+    ok = True
+    def line(good, msg):
+        nonlocal ok
+        ok &= good
+        print(f"{'✓' if good else '✗'} {msg}")
+    try:
+        v = sh([CODEX, "--version"])
+        line(True, f"codex: {v}")
+        st = subprocess.run([CODEX, "login", "status"], text=True, capture_output=True)
+        line(st.returncode == 0, f"codex login: {clip(st.stdout + st.stderr, 120)}")
+    except (RuntimeError, FileNotFoundError):
+        line(False, "codex CLI not found: npm i -g @openai/codex, then `codex login` (ChatGPT account)")
+    line(sys.version_info >= (3, 11), f"python {sys.version.split()[0]} (needs 3.11+)")
+    line(repo_root() is not None, "inside a git repository" if repo_root() else "not in a git repository (implementers need one)")
+    snap = claude_snapshot()
+    line(snap is not None, "Claude statusline snapshot found" if snap else "no Claude statusline snapshot; configure `orc statusline` (README)")
+    print(f"Codex limits: {fmt_windows(codex_windows(codex_limits()))}")
+    return 0 if ok else 1
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="orc", description="Run Codex workers for a Claude Code lead.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("check", help="validate a plan and print it as a table (no Codex calls)")
+    p.add_argument("plan")
+    p = sub.add_parser("run", help="execute a plan; prints a compact summary when every task finishes")
+    p.add_argument("plan")
+    p.add_argument("--only", help="comma-separated task ids")
+    p = sub.add_parser("steer", help="send a follow-up to a task's Codex thread (warm context), then re-check and re-verify")
+    p.add_argument("run")
+    p.add_argument("task")
+    p.add_argument("message")
+    p.add_argument("--no-verify", action="store_true")
+    p = sub.add_parser("merge", help="merge verified branches of a run into the current branch")
+    p.add_argument("run", nargs="?")
+    p.add_argument("tasks", nargs="*")
+    p = sub.add_parser("clean", help="remove a run's worktrees and unmerged branches")
+    p.add_argument("run", nargs="?")
+    p = sub.add_parser("report", help="tokens, API-equivalent cost and limit usage for this task")
+    p.add_argument("runs", nargs="*")
+    p.add_argument("--all", action="store_true")
+    sub.add_parser("statusline", help="Claude Code statusLine command (reads session JSON on stdin)")
+    sub.add_parser("doctor", help="check codex, login, git and statusline setup")
+    a = ap.parse_args(argv)
+    return {"check": cmd_check, "run": cmd_run, "steer": cmd_steer, "merge": cmd_merge, "clean": cmd_clean,
+            "report": cmd_report, "statusline": cmd_statusline, "doctor": cmd_doctor}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

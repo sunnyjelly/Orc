@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "orc worker result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "findings", "changes", "claims", "commands_run", "open_questions"],
+  "properties": {
+    "status": {"type": "string", "enum": ["done", "partial", "blocked"]},
+    "summary": {"type": "string", "description": "2-5 sentences: what was done or found."},
+    "findings": {"type": "array", "items": {"type": "string"}, "description": "Key facts, each with a file:line or source reference."},
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "what"],
+        "properties": {"path": {"type": "string"}, "what": {"type": "string"}}
+      }
+    },
+    "claims": {"type": "array", "items": {"type": "string"}, "description": "Checkable statements about the result, e.g. 'all callers of X updated'."},
+    "commands_run": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cmd", "exit_code"],
+        "properties": {"cmd": {"type": "string"}, "exit_code": {"type": "integer"}}
+      }
+    },
+    "open_questions": {"type": "array", "items": {"type": "string"}}
+  }
+}
