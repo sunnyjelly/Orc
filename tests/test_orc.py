@@ -1,6 +1,7 @@
 """End-to-end tests for bin/orc against tests/fake_codex.py. Run: python3 -m unittest discover tests"""
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -169,6 +170,161 @@ class OrcTest(unittest.TestCase):
         bad = PLAN.replace('files = ["impl-c.txt"]', 'files = ["impl-c.txt"]\nweb = true')
         (self.repo / "p3.toml").write_text(bad)
         self.assertIn("`web` is for explorer/reviewer tasks", self.orc("check", "p3.toml").stdout)
+
+    # ---- regression tests for the independent audit ------------------------------------------
+
+    def plan(self, name, body):
+        (self.repo / name).write_text(textwrap.dedent(body))
+        return name
+
+    def state(self):
+        run_dir = sorted((self.repo / ".orc" / "runs").iterdir())[-1]
+        return run_dir.name, json.loads((run_dir / "state.json").read_text())
+
+    def test_steer_is_saved_then_resume_and_merge(self):
+        self.plan("s.toml", """
+            goal = "steer"
+            checks = ["! grep -rq BROKEN --include=*.txt ."]
+            [[task]]
+            id = "base"
+            role = "implementer"
+            why = "w"
+            brief = "FAKE_BREAK_UNTIL_STEER"
+            acceptance = ["ok"]
+            verify = "checks"
+            [[task]]
+            id = "child"
+            role = "implementer"
+            after = ["base"]
+            why = "w"
+            brief = "b"
+            acceptance = ["ok"]
+            verify = "checks"
+        """)
+        self.assertEqual(self.orc("run", "s.toml").returncode, 2)
+        run_id, st = self.state()
+        self.assertEqual((st["tasks"]["base"]["status"], st["tasks"]["child"]["status"]), ("failed", "skipped"))
+        p = self.orc("steer", run_id, "base", "STEER_FIX the check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(f"orc resume {run_id}", p.stdout)
+        _, st = self.state()
+        self.assertEqual(st["tasks"]["base"]["status"], "checks-passed")          # persisted (audit #1)
+        self.assertEqual([c["name"] for c in st["tasks"]["base"]["calls"]], ["worker", "repair1", "steer2"])
+        p = self.orc("resume", run_id)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        _, st = self.state()
+        self.assertEqual(st["tasks"]["child"]["status"], "checks-passed")
+        self.assertTrue((Path(st["tasks"]["child"]["worktree"]) / "base.txt").exists())
+        p = self.orc("merge", run_id)
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn("merged: base, child", p.stdout)
+        self.assertIn("ok", (self.repo / "base.txt").read_text())
+
+    def test_reviewer_after_implementer_sees_its_code(self):
+        self.plan("r.toml", """
+            goal = "chain"
+            checks = ["true"]
+            [[task]]
+            id = "impl-a"
+            role = "implementer"
+            why = "w"
+            brief = "b"
+            acceptance = ["ok"]
+            verify = "checks"
+            [[task]]
+            id = "rev"
+            role = "reviewer"
+            after = ["impl-a"]
+            why = "w"
+            brief = "review impl-a"
+            [[task]]
+            id = "fix"
+            role = "implementer"
+            after = ["rev"]
+            why = "w"
+            brief = "b"
+            acceptance = ["ok"]
+            verify = "checks"
+        """)
+        p = self.orc("run", "r.toml")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        _, st = self.state()
+        self.assertEqual(st["tasks"]["rev"]["result"]["summary"], "fake worker in impl-a")   # audit #2
+        self.assertTrue((Path(st["tasks"]["fix"]["worktree"]) / "impl-a.txt").exists())
+        self.assertEqual(st["tasks"]["fix"]["parent"], "impl-a")
+
+    def test_blocked_worker_and_check_artifacts(self):
+        self.plan("b.toml", """
+            goal = "blocked"
+            checks = ["touch artifact.log", "! grep -rq BROKEN --include=*.txt ."]
+            [[task]]
+            id = "stuck"
+            role = "implementer"
+            why = "w"
+            brief = "FAKE_BLOCKED"
+            acceptance = ["ok"]
+            files = ["stuck.txt"]
+            [[task]]
+            id = "fine"
+            role = "implementer"
+            why = "w"
+            brief = "b"
+            acceptance = ["ok"]
+            files = ["fine.txt"]
+            verify = "checks"
+        """)
+        self.assertEqual(self.orc("run", "b.toml").returncode, 2)
+        run_id, st = self.state()
+        self.assertEqual(st["tasks"]["stuck"]["status"], "blocked")                    # audit #10
+        self.assertEqual(len(st["tasks"]["stuck"]["calls"]), 1)                         # no checks/verify/repair
+        self.assertEqual(self.orc("merge", run_id).returncode, 0)
+        self.assertTrue((self.repo / "fine.txt").exists())
+        self.assertFalse((self.repo / "artifact.log").exists())                         # audit #9
+
+    def test_merge_conflict_fails(self):
+        self.plan("c.toml", """
+            goal = "conflict"
+            checks = ["true"]
+            [[task]]
+            id = "impl-a"
+            role = "implementer"
+            why = "w"
+            brief = "b"
+            acceptance = ["ok"]
+            verify = "checks"
+        """)
+        self.assertEqual(self.orc("run", "c.toml").returncode, 0)
+        (self.repo / "impl-a.txt").write_text("main's version\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "conflicting"], cwd=self.repo, check=True)
+        p = self.orc("merge")
+        self.assertEqual(p.returncode, 1)                                               # audit #5
+        self.assertIn("merge conflict", p.stdout)
+
+    def test_quota_stop_ignores_reset_windows(self):
+        limits = Path(self.env["ORC_HOME"]) / "codex-limits.json"
+        limits.parent.mkdir(parents=True, exist_ok=True)
+        window = lambda resets: {"rate_limits": {"primary": {"used_percent": 95, "window_minutes": 300, "resets_at": resets}}}
+        limits.write_text(json.dumps(window(1)))                                      # reset long ago
+        self.assertEqual(self.orc("ask", "q").returncode, 0)                            # audit #3
+        limits.write_text(json.dumps(window(4102444800)))                             # resets in 2100
+        p = self.orc("ask", "q")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("skipped: Codex 5h limit at 95%", p.stdout)
+
+    def test_report_for_solo_session_ignores_older_runs(self):
+        status = lambda sid: json.dumps({"session_id": sid, "workspace": {"project_dir": str(self.repo)}})
+        self.orc("statusline", stdin=status("old"))
+        self.assertEqual(self.orc("run", "plan.toml").returncode, 0)
+        run_id, _ = self.state()
+        self.assertRegex(run_id, r"^\d{8}-\d{6}")                                     # audit #8: year in run id
+        self.orc("statusline", stdin=status("new"))
+        self.assertIn("done by the lead alone", self.orc("report").stdout)             # audit #4
+
+    def test_report_ignores_other_projects_session(self):
+        other = {"session_id": "elsewhere", "workspace": {"project_dir": "/some/other/project"}, "cost": {"total_cost_usd": 9}}
+        self.orc("statusline", stdin=json.dumps(other))
+        self.assertIn("no statusline snapshot found", self.orc("report").stdout)       # audit #12
 
     def test_report_without_runs(self):
         p = self.orc("report")

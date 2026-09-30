@@ -3,9 +3,13 @@
 
 Emits the JSONL events orc parses, writes the -o final message as schema-shaped
 JSON, appends a rollout file with rate limits under $CODEX_HOME, and (for
-workspace-write runs) creates a file. Behaviour is steered by the prompt text:
-  FAKE_FAIL_VERIFY_ONCE  -> the first verifier returns "fail"
-  FAKE_BREAK_CHECK       -> the implementer writes a file the checks reject until repaired
+workspace-write runs) creates a file. Behaviour is steered by markers in the
+first prompt of a thread (remembered per thread, so resumes keep the mode):
+  FAKE_FAIL_VERIFY_ONCE   -> the first verifier returns "fail"
+  FAKE_BREAK_CHECK        -> the implementer's first attempt fails the checks
+  FAKE_BREAK_UNTIL_STEER  -> every attempt fails the checks until a prompt contains STEER_FIX
+  FAKE_BLOCKED            -> the worker reports status "blocked"
+Workers report the directory they ran in ("fake worker in <dir name>").
 """
 import fcntl
 import json
@@ -66,13 +70,20 @@ if schema.endswith("verdict.schema.json"):
              "criteria": [{"criterion": "works", "met": "yes" if verdict == "pass" else "no", "evidence": "fake.txt:1"}],
              "issues": [] if verdict == "pass" else [{"severity": "major", "location": "fake.txt:1", "problem": "fake problem"}]}
 else:
+    threads = st.setdefault("threads", {})
+    if not resume:
+        threads[thread] = {m: m in prompt for m in ("FAKE_BREAK_CHECK", "FAKE_BREAK_UNTIL_STEER", "FAKE_BLOCKED")}
+    mode = threads.get(thread, {})
+    if "STEER_FIX" in prompt:
+        mode["FAKE_BREAK_UNTIL_STEER"] = False
     changes = []
     if sandbox == "workspace-write":
         target = cwd / f"{cwd.name}.txt"
-        broken = "FAKE_BREAK_CHECK" in prompt and not resume
+        broken = (mode.get("FAKE_BREAK_CHECK") and not resume) or mode.get("FAKE_BREAK_UNTIL_STEER")
         target.write_text(("BROKEN" if broken else "ok") + f" {st['calls']}\n")
         changes = [{"path": target.name, "what": "wrote fake output"}]
-    final = {"status": "done", "summary": f"fake worker in {cwd.name}", "findings": ["fake finding at a.py:1"],
+    final = {"status": "blocked" if mode.get("FAKE_BLOCKED") else "done",
+             "summary": f"fake worker in {cwd.name}", "findings": ["fake finding at a.py:1"],
              "changes": changes, "claims": ["fake.txt exists"], "commands_run": [{"cmd": "true", "exit_code": 0}],
              "open_questions": []}
 
