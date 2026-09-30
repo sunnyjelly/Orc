@@ -1,7 +1,7 @@
 {
   "name": "orc",
   "displayName": "orc: Claude leads, Codex works",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Claude plans and verifies; OpenAI Codex workers (on your ChatGPT plan) do the work, each change is checked by a verifier that did not write it, and every task ends with a token, cost and usage-limit report. Also includes `delegate`, portable guidance on when and how to use subagents.",
   "author": { "name": "SteliosRapt" },
   "repository": "https://github.com/SteliosRapt/Playground",

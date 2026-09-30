@@ -1014,6 +1014,112 @@ class OrcTest(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
 
 
+    def test_a_planned_continues_claims_the_thread_before_it_runs(self):
+        self.plan("s.toml", """
+            goal = "scout"
+            [[task]]
+            id = "s"
+            role = "explorer"
+            why = "w"
+            brief = "look"
+        """)
+        self.orc("run", "s.toml")
+        run0, st = self.state()
+        thread = st["tasks"]["s"]["calls"][0]["thread"]
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run0}/s") + """
+            [[task]]
+            id = "x"
+            role = "explorer"
+            why = "w"
+            brief = "other"
+        """)
+        self.assertEqual(self.orc("run", "b.toml", "--only", "x").returncode, 0)          # `more` hasn't run, but holds the thread
+        run_b, st = self.state()
+        self.assertNotIn("more", st["tasks"])
+        self.plan("a.toml", self.FOLLOW.replace("{ref}", f"{run0}/s").replace('role = "implementer"', 'role = "explorer"\nweb = true'))
+        p = self.orc("check", "a.toml")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn(f"continued by {run_b}/more", p.stdout)
+        self.assertIn(f"continued by {run_b}/more", self.orc("ask", "--continue", f"{run0}/s", "q").stderr)
+        p = self.orc("resume", run_b)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        _, st = self.state()
+        self.assertEqual(st["tasks"]["more"]["calls"][0]["thread"], thread)
+        self.assertEqual(self.orc("steer", run_b, "more", "again").returncode, 0)          # the claimant owns it
+        # a claim on a web plan entry taints the thread even before it runs; so does an unreadable plan
+        self.plan("w.toml", self.FOLLOW.replace("{ref}", f"{run_b}/more").replace('role = "implementer"', 'role = "explorer"\nweb = true')
+                  + '\n[[task]]\nid = "x"\nrole = "explorer"\nwhy = "w"\nbrief = "other"\n')
+        self.assertEqual(self.orc("run", "w.toml", "--only", "x").returncode, 0)
+        run_w, _ = self.state()
+        self.plan("i.toml", self.FOLLOW.replace("{ref}", f"{run_w}/more"))
+        self.assertIn("used web search", self.orc("check", "i.toml").stdout)
+        (self.repo / ".orc" / "runs" / run_w / "plan.toml").write_text("not toml [")
+        self.assertIn("used web search", self.orc("check", "i.toml").stdout)
+
+    def test_web_is_recorded_in_state_and_survives_a_lost_plan(self):
+        self.plan("a.toml", """
+            goal = "web"
+            [[task]]
+            id = "e"
+            role = "explorer"
+            web = true
+            why = "w"
+            brief = "search"
+        """)
+        self.orc("run", "a.toml")
+        run_a, st = self.state()
+        self.assertTrue(st["tasks"]["e"]["web"])
+        (self.repo / ".orc" / "runs" / run_a / "plan.toml").unlink()
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/e"))
+        self.assertIn("used web search", self.orc("check", "b.toml").stdout)
+        p = self.orc("ask", "--continue", f"{run_a}/e", "what did you find?")            # questions never search the web
+        self.assertIn("web=False", p.stdout)
+
+    def test_a_running_task_cannot_be_resumed_elsewhere(self):
+        self.plan("a.toml", self.ONE)
+        self.orc("run", "a.toml")
+        run_a, st = self.state()
+        path = self.repo / ".orc" / "runs" / run_a / "state.json"
+        st["tasks"]["impl-a"].update(status="running", pid=os.getpid())                  # a live orc process holds it
+        path.write_text(json.dumps(st))
+        for args in (("ask", "--continue", f"{run_a}/impl-a", "q"), ("steer", run_a, "impl-a", "x")):
+            p = self.orc(*args)
+            self.assertEqual(p.returncode, 1, args)
+            self.assertIn("is running right now", p.stderr)
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        self.assertIn("is running right now", self.orc("check", "b.toml").stdout)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        st["tasks"]["impl-a"]["pid"] = dead.pid                                          # its process died: usable again
+        path.write_text(json.dumps(st))
+        self.assertEqual(self.orc("ask", "--continue", f"{run_a}/impl-a", "q").returncode, 0)
+
+    def test_malformed_runs_do_not_break_other_commands(self):
+        self.plan("a.toml", self.ONE)
+        self.orc("run", "a.toml")
+        run_a, _ = self.state()
+        runs = self.repo / ".orc" / "runs"
+        for name, state in (("20200101-000001", {"tasks": []}), ("20200101-000002", {"tasks": {"t": {"calls": None}}}),
+                            ("20200101-000003", {"tasks": {"t": {"calls": [1, {"thread": "x"}, {"name": None, "thread": "y"}]}}}),
+                            ("20200101-000004", {"tasks": {"t": "junk"}, "continues": ["x"]})):
+            (runs / name).mkdir()
+            (runs / name / "state.json").write_text(json.dumps(state))
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        for args in (("check", "b.toml"), ("show",), ("show", f"{run_a}/impl-a"), ("ask", "--continue", f"{run_a}/impl-a", "q"),
+                     ("steer", run_a, "impl-a", "again")):
+            p = self.orc(*args)
+            self.assertEqual(p.returncode, 0, (args, p.stdout, p.stderr))
+
+    def test_same_second_runs_sort_numerically(self):
+        runs = self.repo / ".orc" / "runs"
+        for name in ("20260930-101010", "20260930-101010-2", "20260930-101010-10"):
+            (runs / name).mkdir(parents=True)
+            (runs / name / "state.json").write_text(json.dumps({"id": name, "goal": f"goal {name}", "order": [], "tasks": {}}))
+        out = self.orc("show").stdout
+        self.assertLess(out.index("goal 20260930-101010-10"), out.index("goal 20260930-101010-2"))
+        self.assertIn("run 20260930-101010-10 ", self.orc("resume").stderr)                 # the latest run
+
+
 class PackagingTest(unittest.TestCase):
     def test_dist_skills_match_sources(self):
         p = subprocess.run([sys.executable, str(ROOT / "tools" / "build_skills.py"), "--check"], text=True, capture_output=True)

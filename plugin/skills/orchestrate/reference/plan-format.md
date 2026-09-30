@@ -69,7 +69,7 @@ How a task runs:
   - `stale`: an upstream task was steered after this task ran; merge the updated upstream task and write a new plan for this work. Its old branch is preserved; even an explicit merge cannot bypass stale dependencies.
   - `skipped`: a dependency didn't succeed, or the Codex quota guard stopped it; `orc resume <run>` runs skipped tasks later
 - `continues`: the task's first call resumes the Codex thread of `<run>/<task>` from any earlier run, instead of starting cold. The worker keeps its memory of the earlier work. It still gets the full brief, runs in a fresh worktree (or the usual read-only directory), and goes through the normal checks, verification and repairs. The prompt tells it whether its earlier changes are already in the checkout (merged) or not (then it must redo what it still needs). Use it for follow-up work on merged tasks, redoing stale work, or implementing what an explorer worked out. Rules:
-  - The thread then belongs to the new task. Steer, question or continue that task from now on; orc refuses the old one.
+  - The thread belongs to the new task from the moment its run starts. Steer, question or continue that task from now on; orc refuses the old one, and any task while it is running.
   - One thread per plan.
   - An implementer can't continue a thread that ever used web search. Keep the same model, so the prompt cache carries over.
 - A read-only task that comes after an implementer (directly or through other read-only tasks) runs in that implementer's worktree, so it sees the new code. An implementer that comes after one branches from its branch.
