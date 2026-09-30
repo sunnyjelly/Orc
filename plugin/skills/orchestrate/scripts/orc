@@ -389,6 +389,9 @@ def load_plan(path: str) -> tuple[dict, list[str], list[str]]:
         t["after"] = list(t.get("after", []))
         t["files"] = list(t.get("files", []))
         t["checks"] = list(plan.get("checks", [])) + list(t.get("checks", []))
+        t["continues"] = t.get("continues") or ""
+        if t["continues"] and not (isinstance(t["continues"], str) and re.fullmatch(r"[\w.-]+(/[a-z0-9][a-z0-9-]*)?", t["continues"])):
+            errs.append(f"{tid}: `continues` must be \"<run>/<task>\" or an ask id")
         t["network"] = bool(t.get("network", defaults.get("network", False)))
         t["timeout_min"] = integer(t.get("timeout_min", defaults.get("timeout_min", 30)), f"{tid}: timeout_min", 1, 30)
         t["max_repairs"] = integer(t.get("max_repairs", defaults.get("max_repairs", 1)), f"{tid}: max_repairs", 0, 1)
@@ -510,7 +513,8 @@ def render_plan(plan: dict) -> str:
     rows = ["| # | task | role · model effort | after | verification | why |", "|---|---|---|---|---|---|"]
     for i, t in enumerate(plan["task"], 1):
         short = next((k for k, v in MODEL_ALIASES.items() if v == t["model"]), t["model"])
-        rows.append(f"| {i} | {t['id']} | {t['role']} · {short} {t['effort']}{' · web' if t['web'] else ''} | {', '.join(t['after']) or '-'} | "
+        rows.append(f"| {i} | {t['id']} | {t['role']} · {short} {t['effort']}{' · web' if t['web'] else ''}"
+                    f"{' · ↻ ' + t['continues'] if t['continues'] else ''} | {', '.join(t['after']) or '-'} | "
                     f"{verify_label(t)} | {clip(t['why'], 90)} |")
     lo, hi = codex_call_estimate(plan)
     lines = [f"**Plan:** {plan['goal']}  (risk: {plan['risk']}, max parallel: {plan.get('max_parallel', 3)})", "", *rows, "",
@@ -532,6 +536,17 @@ def quota_blocked(quota_stop: float) -> str | None:
 
 def call_succeeded(call: dict) -> bool:
     return call.get("final") is not None and not call.get("error")
+
+
+def task_thread(rec: dict) -> str | None:
+    """The worker's own Codex thread (not a verifier's): the one repairs, steers and follow-ups resume."""
+    return next((c["thread"] for c in reversed(rec.get("calls", [])) if c.get("thread")
+                 and c["name"].startswith(("worker", "repair", "steer"))), None)
+
+
+def is_ancestor(ancestor: str | None, descendant: str, cwd) -> bool:
+    return bool(ancestor) and subprocess.run(["git", "merge-base", "--is-ancestor", ancestor, descendant],
+                                             cwd=cwd, capture_output=True).returncode == 0
 
 
 def codex_exec(*, model: str, effort: str, sandbox: str, cwd: Path, prompt: str, logdir: Path, name: str,
@@ -627,8 +642,29 @@ class Run:
 
     # ------------------------------------------------------------ prompts
 
-    def worker_prompt(self, t: dict) -> str:
+    def continued(self, t: dict) -> dict | None:
+        return (self.state.get("continues") or {}).get(t["id"])
+
+    def continuation(self, src: dict, cwd: Path) -> str:
+        lines = [f"## Follow-up to your earlier work ({src['ref']})",
+                 f"This continues your earlier Codex thread with a new task, described below. Work only in the current directory "
+                 f"({cwd}), not in any directory you used before, and re-read files before editing: they may have changed since."]
+        if src["kind"] == "ask":
+            lines.append("Earlier you answered as a read-only consultant; now take the role described below.")
+        elif src.get("role") == "implementer":
+            if not src.get("head"):
+                lines.append("Your earlier changes are NOT in this checkout (their branch was removed); redo what the new task needs.")
+            elif is_ancestor(src["head"], "HEAD", cwd):
+                lines.append(f"Your earlier changes (commit {src['head'][:10]}) are already in this checkout.")
+            else:
+                lines.append(f"Your earlier changes are NOT in this checkout (they are on {src.get('branch') or 'commit'} "
+                             f"{src['head'][:10]}); redo what the new task still needs.")
+        return "\n".join(lines)
+
+    def worker_prompt(self, t: dict, cwd: Path | None = None) -> str:
         parts = [(PROMPTS / f"{t['role']}.md").read_text().strip(), f"## Team goal\n{self.plan['goal']}"]
+        if (src := self.continued(t)):
+            parts.insert(0, self.continuation(src, cwd or self.repo or Path.cwd()))
         if self.plan.get("context"):
             parts.append(f"## Shared context and decisions (binding for every worker)\n{self.plan['context'].strip()}")
         others = [f"- {o['id']} ({o['role']}): {o['why']}" for o in self.plan["task"] if o["id"] != t["id"]]
@@ -709,6 +745,8 @@ class Run:
         rec = self.state["tasks"].get(t["id"], {})
         rec.update(id=t["id"], role=t["role"], effort=t["effort"], model=t["model"], verify=t["verify"],
                    status="running", started=now_iso(), error=None)
+        if t["continues"]:
+            rec["continues"] = t["continues"]
         rec.setdefault("calls", [])
         self.state["tasks"][t["id"]] = rec
         self.save()
@@ -721,7 +759,8 @@ class Run:
                 if t.get("base_writer"):
                     cwd = Path(self.state["tasks"][t["base_writer"]]["worktree"])  # see the code it builds on
                 name = f"worker{len(rec['calls'])}" if rec["calls"] else "worker"
-                call = self.codex(t, name, self.worker_prompt(t), "worker-result", cwd, "read-only")
+                resume = (task_thread(rec) or self.continued(t)["thread"]) if self.continued(t) else None
+                call = self.codex(t, name, self.worker_prompt(t, cwd), "worker-result", cwd, "read-only", resume=resume)
                 rec["calls"].append(call)
                 rec["result"] = call["final"]
                 rec["status"] = call["final"]["status"] if call_succeeded(call) else ("skipped" if call.get("skipped") else "error")
@@ -749,10 +788,9 @@ class Run:
             rec.update(branch=branch, worktree=str(wt), base=base, parent=parent)
             self.save()
 
-        thread = next((c["thread"] for c in reversed(rec["calls"]) if c.get("thread") and
-                       c["name"].startswith(("worker", "repair", "steer"))), None)
+        thread = task_thread(rec) or (self.continued(t) or {}).get("thread")
         name = f"worker{len(rec['calls'])}" if rec["calls"] else "worker"
-        call = self.codex(t, name, self.worker_prompt(t), "worker-result", wt, "workspace-write", resume=thread)
+        call = self.codex(t, name, self.worker_prompt(t, wt), "worker-result", wt, "workspace-write", resume=thread)
         rec["calls"].append(call)
         rec["result"], thread = call["final"], call["thread"]
         if not call_succeeded(call):
@@ -857,7 +895,7 @@ class Run:
 OK_STATUSES = ("done", "verified", "checks-passed")
 
 
-def task_line(r: dict) -> list[str]:
+def task_line(r: dict, max_findings: int = 10) -> list[str]:
     mark = "✓" if r["status"] in OK_STATUSES else ("~" if r["status"] in ("partial", "uncertain", "unverified") else "✗")
     usage = {k: 0 for k in USAGE_KEYS}
     for c in r.get("calls", []):
@@ -880,9 +918,9 @@ def task_line(r: dict) -> list[str]:
     if res.get("summary"):
         lines.append(f"   {clip(res['summary'], 400)}")
     if r.get("role") in ("explorer", "reviewer"):
-        lines += [f"   - {clip(f, 240)}" for f in res.get("findings", [])[:10]]
-        if len(res.get("findings", [])) > 10:
-            lines.append(f"   … {len(res['findings']) - 10} more in result")
+        lines += [f"   - {clip(f, 240)}" for f in res.get("findings", [])[:max_findings]]
+        if len(res.get("findings", [])) > max_findings:
+            lines.append(f"   … {len(res['findings']) - max_findings} more: `orc show <run>/{r['id']}`")
     for v in r.get("verdicts", []):
         for i in v.get("issues", [])[:5]:
             lines.append(f"   ! [{i['severity']}] {clip(i['location'], 60)}: {clip(i['problem'], 200)}")
@@ -957,8 +995,78 @@ def find_run(repo: Path | None, run_id: str | None) -> Path:
     return runs[-1]
 
 
+def asks_dir(repo: Path | None) -> Path:
+    return runs_dir(repo).parent / "asks"
+
+
+def find_ask(asks: list[dict], ref: str, sid: str | None = None) -> dict | None:
+    """An ask by id, or `last`: the newest ask with a thread (this Claude session's if it has one)."""
+    if ref != "last":
+        return next((x for x in reversed(asks) if x.get("id") == ref), None)
+    usable = [x for x in asks if x.get("thread")]
+    return ([x for x in usable if sid and x.get("claude_session") == sid] or usable or [None])[-1]
+
+
+def thread_source(repo: Path | None, ref: str) -> dict | str:
+    """The Codex thread behind `<run>/<task>` or an ask id, for a follow-up; an error string if there is none."""
+    if "/" in ref:
+        run_id, _, tid = ref.partition("/")
+        run_dir = runs_dir(repo) / run_id
+        state = read_json(run_dir / "state.json")
+        if not state:
+            return f"no run {run_id}"
+        rec = state.get("tasks", {}).get(tid)
+        thread = task_thread(rec or {})
+        if not thread:
+            return f"{ref} has no Codex thread to continue" if rec else f"no task {tid} in run {run_id}"
+        branch = rec.get("branch")
+        head = (git("rev-parse", "--verify", "-q", f"{branch}^{{commit}}", cwd=repo, check=False) if branch and repo else "")
+        try:
+            web = any(t.get("id") == tid and t.get("web") for t in tomllib.loads((run_dir / "plan.toml").read_text()).get("task", []))
+        except (OSError, tomllib.TOMLDecodeError):
+            web = False
+        return {"ref": ref, "root": ref, "kind": "task", "thread": thread, "model": rec.get("model"), "effort": rec.get("effort"),
+                "role": rec.get("role"), "branch": branch, "head": head or rec.get("merged_head"), "merged": bool(rec.get("merged")),
+                "worktree": rec.get("worktree"), "web": web}
+    x = find_ask(read_jsonl(asks_dir(repo) / "asks.jsonl"), ref)
+    if not x:
+        return f"no ask or run task {ref!r} (use an ask id or <run>/<task>; see `orc history`)"
+    if not x.get("thread"):
+        return f"ask {ref} has no Codex thread to continue (it failed before starting)"
+    return {"ref": x["id"], "root": x.get("root") or x["id"], "kind": "ask", "thread": x["thread"], "model": x.get("model"),
+            "effort": x.get("effort"), "web": x.get("web"), "research": x.get("research")}
+
+
+def resolve_continues(plan: dict, repo: Path | None) -> tuple[list[str], list[str], dict]:
+    """Look up the thread each `continues` task resumes. Returns (errors, warnings, {task id: source})."""
+    errs, warns, out, owner = [], [], {}, {}
+    for t in plan["task"]:
+        ref = t.get("continues")
+        if not ref:
+            continue
+        src = thread_source(repo, ref)
+        if isinstance(src, str):
+            errs.append(f"{t['id']}: {src}")
+            continue
+        if t["writes"] and src.get("web"):
+            errs.append(f"{t['id']}: an implementer can't continue a web-search thread (web pages in its context are a "
+                        "prompt-injection path); have it build on that task with `after`, or continue it with a read-only task")
+            continue
+        if src["thread"] in owner:
+            errs.append(f"{t['id']} and {owner[src['thread']]} continue the same Codex thread; give it to one task")
+            continue
+        owner[src["thread"]] = t["id"]
+        if src.get("model") and src["model"] != t["model"]:
+            warns.append(f"{t['id']}: continues a {src['model']} thread with {t['model']}; its prompt cache won't carry over")
+        out[t["id"]] = src
+    return errs, warns, out
+
+
 def cmd_check(a) -> int:
     plan, errs, warns = load_plan(a.plan)
+    if not errs:
+        cerrs, cwarns, _ = resolve_continues(plan, repo_root())
+        errs, warns = errs + cerrs, warns + cwarns
     for w in warns:
         print(f"warning: {w}")
     if errs:
@@ -978,10 +1086,14 @@ def cmd_check(a) -> int:
 
 def cmd_run(a) -> int:
     plan, errs, warns = load_plan(a.plan)
+    repo = repo_root()
+    continues = {}
+    if not errs:
+        cerrs, _, continues = resolve_continues(plan, repo)
+        errs += cerrs
     if errs:
         print("plan is invalid:\n" + "\n".join(f"- {e}" for e in errs))
         return 1
-    repo = repo_root()
     if any(t["writes"] for t in plan["task"]) and not repo:
         die("implementer tasks need a git repository")
     base = git("rev-parse", plan.get("base", "HEAD"), cwd=repo) if repo else None
@@ -999,7 +1111,7 @@ def cmd_run(a) -> int:
     claude = claude_snapshot(repo)
     state = {"id": run_id, "goal": plan["goal"], "risk": plan["risk"], "base": base, "started": now_iso(),
              "order": [t["id"] for t in plan["task"]], "tasks": {}, "codex_start": codex_start,
-             "claude_session": (claude or {}).get("session_id")}
+             "claude_session": (claude or {}).get("session_id"), "continues": continues}
     write_json(run_dir / "state.json", state)
     print(f"orc run {run_id} started ({len(plan['task'])} tasks). Summary follows when all finish.", flush=True)
     run = Run(plan, repo, run_dir, run_id, base)
@@ -1029,11 +1141,12 @@ def cmd_steer(a) -> int:
     rec = run.state.get("tasks", {}).get(a.task)  # the Run's own state: this is what save() writes
     if not t or not rec:
         die(f"unknown task {a.task} in run {run.id}")
+    hint = f'to keep its warm context, set `continues = "{run.id}/{a.task}"` on a task in the new plan'
     if rec.get("merged"):
-        die(f"{a.task} is already merged; start a new plan for further changes")
+        die(f"{a.task} is already merged; start a new plan for further changes ({hint})")
     if rec.get("status") == "stale":
-        die(f"{a.task} has stale dependencies; start a new plan on the updated code")
-    thread = next((c["thread"] for c in rec.get("calls", []) if c.get("thread") and c["name"].startswith(("worker", "repair", "steer"))), None)
+        die(f"{a.task} has stale dependencies; start a new plan on the updated code ({hint})")
+    thread = task_thread(rec)
     if not thread:
         die("task has no Codex thread to resume")
     if t["writes"] and not Path(rec.get("worktree", "")).is_dir():
@@ -1267,33 +1380,190 @@ def cmd_report(a) -> int:
     return 0
 
 
+def research_summary(text: str) -> str:
+    m = re.search(r"^## Summary\s*\n(.*?)(?=^## |\Z)", text or "", re.S | re.M)
+    return m.group(1).strip() if m else "\n".join((text or "").splitlines()[:25])
+
+
+def short_model(model: str | None) -> str:
+    return next((k for k, v in MODEL_ALIASES.items() if v == model), model or "?")
+
+
+REPORT_FORMAT = "Reply in the same format as your report: ## Summary, ## Details, ## Disagreements and uncertainty, ## Sources."
+
+
 def cmd_ask(a) -> int:
     repo = repo_root()
-    d = runs_dir(repo).parent / "asks"
+    d = asks_dir(repo)
+    claude = claude_snapshot(repo)
+    sid = (claude or {}).get("session_id")
     ask_id = dt.datetime.now().strftime("%m%d-%H%M%S-%f")[:-3]
     question = sys.stdin.read() if a.question == "-" else a.question
-    prompt = (PROMPTS / ("research.md" if a.research else "ask.md")).read_text().strip() + f"\n\n## Question\n{question.strip()}\n"
+    src, cwd = None, repo or Path.cwd()
+    if a.cont:  # follow-up: resume the earlier ask's (or task's) Codex thread, which remembers the conversation
+        ref = a.cont
+        if ref == "last":
+            ref = (find_ask(read_jsonl(d / "asks.jsonl"), "last", sid) or die("no earlier ask to continue"))["id"]
+        src = thread_source(repo, ref)
+        if isinstance(src, str):
+            die(src)
+    research = a.research or bool((src or {}).get("research"))
+    web = a.web or research or bool((src or {}).get("web"))
+    model = resolve_model(a.model or (src or {}).get("model") or "sol")
+    effort = a.effort or (src["effort"] if src and src["kind"] == "ask" else None) or "high"
+    if not src:
+        prompt = (PROMPTS / ("research.md" if research else "ask.md")).read_text().strip() + f"\n\n## Question\n{question.strip()}\n"
+    elif src["kind"] == "ask":
+        prompt = ((PROMPTS / "research.md").read_text().strip() + "\n\n" if a.research and not src.get("research") else "")
+        prompt += f"## Follow-up question\n{question.strip()}\n" + (f"\n{REPORT_FORMAT}\n" if research else "")
+    else:
+        wt = Path(src["worktree"]) if src.get("worktree") else None
+        if wt and wt.is_dir():
+            cwd, where = wt, "your worktree, with your latest changes"
+        elif src["merged"]:
+            where = "the main repository, which contains your merged changes"
+        elif src.get("role") == "implementer":
+            where = "the main repository; your worktree was removed and your changes are not in it"
+        else:
+            where = "the repository"
+        prompt = (f"## Follow-up question from the lead (read-only)\nThis is a question about your work on `{src['ref']}`, not a new task: "
+                  f"you cannot modify files. The current directory is {where}. Answer in plain prose, not JSON, in at most about "
+                  f"200 words unless the question needs more, and cite file:line.\n\n{question.strip()}\n")
     codex_start = read_json(ORC_HOME / "codex-limits.json") or codex_limits()
-    model = resolve_model(a.model)
-    rec = codex_exec(model=model, effort=a.effort, sandbox="read-only", cwd=repo or Path.cwd(), prompt=prompt, logdir=d,
-                     name=ask_id, web=a.web or a.research, timeout_min=a.timeout or (30 if a.research else 10))
-    claude = claude_snapshot(repo)
-    entry = {"id": ask_id, "at": now_iso(), "question": clip(question, 200), "research": a.research, "web": a.web or a.research,
-             "claude_session": (claude or {}).get("session_id"), "codex_start": codex_start,
+    rec = codex_exec(model=model, effort=effort, sandbox="read-only", cwd=cwd, prompt=prompt, logdir=d, name=ask_id,
+                     web=web, resume=(src or {}).get("thread"), timeout_min=a.timeout or (30 if research else 10))
+    entry = {"id": ask_id, "at": now_iso(), "question": clip(question, 300), "research": research, "web": web,
+             "claude_session": sid, "codex_start": codex_start,
+             **({"parent": src["ref"], "root": src["root"]} if src else {}),
              **{k: rec.get(k) for k in ("model", "effort", "usage", "cost", "seconds", "thread", "error")}}
     with open(d / "asks.jsonl", "a") as f:
         f.write(json.dumps(entry) + "\n")
-    footer = (f"— {a.model} · {a.effort}{' · web' if entry['web'] else ''} · "
-              f"{fmt_tok(rec['usage']['input_tokens'] + rec['usage']['output_tokens'])} tok · ≈${rec.get('cost') or 0:.2f} · {fmt_secs(rec.get('seconds'))}")
+    footer = (f"— {short_model(model)} · {effort}{' · web' if web else ''} · "
+              f"{fmt_tok(rec['usage']['input_tokens'] + rec['usage']['output_tokens'])} tok · ≈${rec.get('cost') or 0:.2f} · "
+              f"{fmt_secs(rec.get('seconds'))} · ask {ask_id}" + (f" (follow-up to {src['ref']})" if src else ""))
     if not call_succeeded(rec):
         print(f"ask failed: {rec['error']}\n{footer}")
         return 1
-    if a.research:
-        m = re.search(r"^## Summary\s*\n(.*?)(?=^## |\Z)", rec["final"], re.S | re.M)
-        summary = m.group(1).strip() if m else "\n".join(rec["final"].splitlines()[:25])
-        print(f"{summary}\n\nFull report: {d / (ask_id + '.final.md')}\n{footer}")
+    if research:
+        print(f"{research_summary(rec['final'])}\n\nFull report: {d / (ask_id + '.final.md')}\n{footer}")
     else:
         print(f"{rec['final']}\n{footer}")
+    return 0
+
+
+def local_time(iso: str | None) -> str:
+    try:
+        return dt.datetime.fromisoformat(iso).strftime("%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return "?"
+
+
+def cmd_history(a) -> int:
+    """Compact list of earlier runs and asks in this repo, newest first."""
+    repo = repo_root()
+    d, ad = runs_dir(repo), asks_dir(repo)
+    needle = (a.grep or "").lower()
+
+    def hit(*texts):
+        return not needle or any(needle in (t or "").lower() for t in texts)
+
+    def read(path):
+        try:
+            return Path(path).read_text(errors="replace")
+        except OSError:
+            return ""
+
+    runs = []
+    for p in sorted((p for p in d.iterdir() if (p / "state.json").exists()), key=lambda p: p.name, reverse=True):
+        st = read_json(p / "state.json", {})
+        tasks = st.get("tasks", {})
+        if hit(st.get("goal"), *([read(p / "plan.toml")] + [json.dumps(r.get("result") or {}) for r in tasks.values()] if needle else [])):
+            runs.append((p.name, st))
+    asks = read_jsonl(ad / "asks.jsonl")
+    by_id = {x.get("id"): x for x in asks}
+    follow_ups: dict[str, int] = {}
+    roots, seen = [], set()
+    for x in reversed(asks):  # newest activity first; a conversation is listed once, under its first ask
+        key = x.get("root") if x.get("root") in by_id else x.get("id")
+        if x.get("parent") and key != x.get("id"):
+            follow_ups[key] = follow_ups.get(key, 0) + 1
+        if key in seen or not hit(x.get("question"), *([read(ad / f"{x['id']}.prompt.md"), read(ad / f"{x['id']}.final.md")] if needle else [])):
+            continue
+        seen.add(key)
+        roots.append(by_id[key])
+    out = []
+    if runs:
+        out.append("Runs (`orc show <run>` or `<run>/<task>`):")
+        for rid, st in runs[:a.n]:
+            tasks = st.get("tasks", {})
+            out.append(f"{rid}  {local_time(st.get('started'))}  {clip(st.get('goal'), 90)}")
+            out.append("  " + clip(" · ".join(f"{tid} {tasks[tid].get('status')}{' (merged)' if tasks[tid].get('merged') else ''}"
+                                               for tid in st.get("order", []) if tid in tasks), 200))
+        if len(runs) > a.n:
+            out.append(f"… {len(runs) - a.n} older runs (use -n)")
+    if roots:
+        out.append("Asks (`orc show <id>`, `orc ask --continue <id> \"…\"`):")
+        for x in roots[:a.n]:
+            kind = "research" if x.get("research") else "ask"
+            more = follow_ups.get(x["id"], 0)
+            out.append(f"{x['id']}  {local_time(x.get('at'))}  {kind} · {short_model(x.get('model'))} {x.get('effort')}  "
+                       f"{clip(x.get('question'), 90)}" + (f" → {x['parent']}" if x.get("parent") else "")
+                       + (f"  (+{more} follow-up{'s' if more > 1 else ''})" if more else "") + ("  ✗ failed" if x.get("error") else ""))
+        if len(roots) > a.n:
+            out.append(f"… {len(roots) - a.n} older asks (use -n)")
+    print("\n".join(out) or (f"nothing matches {a.grep!r}" if needle else "no runs or asks yet"))
+    return 0
+
+
+def cmd_show(a) -> int:
+    """Re-read an earlier run, task or ask conversation."""
+    repo = repo_root()
+    ref = a.ref
+    if not ref or (runs_dir(repo) / ref / "state.json").exists():
+        run_dir = find_run(repo, ref)
+        print(run_summary(run_dir, read_json(run_dir / "state.json")) + f"\nTask details: `orc show {run_dir.name}/<task>`")
+        return 0
+    if "/" in ref:
+        run_id, _, tid = ref.partition("/")
+        run_dir = find_run(repo, run_id)
+        r = read_json(run_dir / "state.json").get("tasks", {}).get(tid) or die(f"no task {tid} in run {run_id}")
+        res = r.get("result") or {}
+        out = task_line(r, max_findings=1000)
+        brief = next((t.get("brief", "") for t in tomllib.loads((run_dir / "plan.toml").read_text()).get("task", []) if t.get("id") == tid), "")
+        out.insert(1, f"   brief: {clip(brief, 300)}")
+        if r.get("continues"):
+            out.insert(1, f"   continues {r['continues']}")
+        out += [f"   - changed {c['path']}: {clip(c['what'], 200)}" for c in res.get("changes", [])]
+        out += [f"   - claim: {clip(c, 200)}" for c in res.get("claims", [])]
+        wt = r.get("worktree")
+        where = f"worktree {wt}" if wt and Path(wt).is_dir() else ("merged" if r.get("merged") else "")
+        out.append(f"   {r.get('model', '?')} thread {task_thread(r) or 'none'}" + (f" · {where}" if where else "")
+                   + f" · calls: {', '.join(c['name'] for c in r.get('calls', []))}")
+        if task_thread(r):
+            out.append(f"Follow up: `orc ask --continue {ref} \"…\"` (question, read-only) · "
+                       f"`continues = \"{ref}\"` on a task in a new plan (more work)")
+        print("\n".join(out))
+        return 0
+    ad = asks_dir(repo)
+    asks = read_jsonl(ad / "asks.jsonl")
+    x = find_ask(asks, ref, (claude_snapshot(repo) or {}).get("session_id")) or die(f"no run, task or ask {ref!r}; see `orc history`")
+    root = x.get("root") or x["id"]
+    chain = [y for y in asks if (y.get("root") or y.get("id")) == root]
+    out = [f"Questions to {root}:"] if "/" in root else []
+    for y in chain:
+        out.append(f"Q {y['id']} · {short_model(y.get('model'))} {y.get('effort')}{' · research' if y.get('research') else ''} · "
+                   f"{local_time(y.get('at'))}: {y.get('question')}")
+        final = ad / f"{y['id']}.final.md"
+        text = final.read_text().strip() if final.exists() else ""
+        if y.get("error") or not text:
+            out.append(f"A: (failed: {y.get('error') or 'no answer'})")
+        elif y.get("research"):
+            out.append(f"A: {research_summary(text)}\n   Full report: {final}")
+        else:
+            out.append(f"A: {text}")
+        out.append("")
+    out.append(f"Continue: `orc ask --continue {chain[-1]['id']} \"…\"`")
+    print("\n".join(out))
     return 0
 
 
@@ -1400,18 +1670,25 @@ def main(argv=None) -> int:
     p.add_argument("--all", action="store_true")
     p = sub.add_parser("ask", help="quick read-only consult: second opinion, lookup, or --research (web) report")
     p.add_argument("question", help="the question, or - to read it from stdin")
-    p.add_argument("--model", default="sol", help="sol (default, GPT-6.1 Sol), luna (cheaper), or a full model id")
-    p.add_argument("--effort", default="high", choices=EFFORTS)
+    p.add_argument("--model", help="sol (default, GPT-6.1 Sol), luna (cheaper), or a full model id; a follow-up keeps its thread's")
+    p.add_argument("--effort", choices=EFFORTS, help="default high; a follow-up keeps its ask's")
+    p.add_argument("--continue", dest="cont", metavar="REF",
+                   help="follow-up in an earlier thread: an ask id, `last`, or <run>/<task> (asks that worker, read-only)")
     p.add_argument("--web", action="store_true", help="enable live web search")
     p.add_argument("--research", action="store_true", help="multi-source web research; full report to a file, summary printed")
     p.add_argument("--timeout", type=int, help="minutes (default 10, research 30)")
+    p = sub.add_parser("history", help="list earlier runs and asks, newest first")
+    p.add_argument("--grep", help="only those mentioning this text")
+    p.add_argument("-n", type=int, default=10, help="how many of each (default 10)")
+    p = sub.add_parser("show", help="re-read a run (default latest), a task (<run>/<task>) or an ask conversation (<id> or last)")
+    p.add_argument("ref", nargs="?")
     sub.add_parser("statusline", help="Claude Code statusLine command (reads session JSON on stdin)")
     p = sub.add_parser("setup", help="install a stable copy of orc and set Claude Code's status line to it")
     p.add_argument("--force", action="store_true", help="replace an existing non-orc status line")
     sub.add_parser("doctor", help="check codex, login, git and statusline setup")
     a = ap.parse_args(argv)
     return {"check": cmd_check, "run": cmd_run, "steer": cmd_steer, "resume": cmd_resume, "merge": cmd_merge, "clean": cmd_clean,
-            "report": cmd_report, "ask": cmd_ask, "setup": cmd_setup, "statusline": cmd_statusline, "doctor": cmd_doctor}[a.cmd](a)
+            "report": cmd_report, "ask": cmd_ask, "history": cmd_history, "show": cmd_show, "setup": cmd_setup, "statusline": cmd_statusline, "doctor": cmd_doctor}[a.cmd](a)
 
 
 if __name__ == "__main__":

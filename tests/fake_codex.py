@@ -54,7 +54,7 @@ if schema is None:  # orc ask: plain-text answer that echoes how it was called
     if "## Disagreements and uncertainty" in prompt:
         final = f"## Summary\n- fake research finding ({info})\n\n## Details\nlong details\n\n## Sources\n1. https://example.com\n"
     else:
-        final = f"fake answer ({info})"
+        final = f"fake answer ({info}) [cwd={cwd.name} sandbox={sandbox} resume={resume}]"
     Path(out).write_text(final)
     print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5000, "cached_input_tokens": 1000,
                                                            "output_tokens": 500, "reasoning_output_tokens": 200}}))

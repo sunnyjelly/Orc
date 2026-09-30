@@ -17,7 +17,9 @@ You are the lead engineer. Workers are Codex runs (GPT-6.1 Sol on the user's Cha
 - `--model luna`: much cheaper, only for simple lookups and triage where depth doesn't matter.
 - `orc ask --web "…"`: a fast web lookup. The raw search results stay out of your context.
 - `orc ask --research "…"`: multi-source web research. You get the summary; the full cited report goes to a file you open only if needed.
-- Put everything the consultant needs into the question; it has not seen this conversation.
+- Put everything the consultant needs into the first question; it has not seen this conversation.
+- `orc ask --continue <ask-id|last> "…"`: a follow-up in the same Codex thread, which remembers the earlier questions and answers (same model and mode). Each answer's footer names its ask id.
+- `orc ask --continue <run>/<task> "…"`: ask a finished worker about its own work, read-only.
 - Skip it when one grep or file read answers the question. Prefer Sol; Luna never implements or verifies.
 
 ## 1. Triage (in your head, no tool calls)
@@ -69,6 +71,8 @@ The run summary normally has everything you need. Open files under `.orc/runs/` 
 - `orc merge <run> && <project test command>` in one call (merge exits non-zero on a conflict), then fix anything the combined result breaks.
 - `blocked` means the worker stopped to ask something: answer its open question with `orc steer`, or re-plan.
 - **stale**: an upstream task was steered after this task ran. Merge the updated upstream task, then write a new plan for the stale work; its old branch is preserved.
+- **Follow-up work** on a merged, stale or older task: in the new plan, set `continues = "<run>/<task>"` on the task. It resumes that worker's warm thread in a fresh worktree, with the usual gates. This is cheaper than a cold worker that has to re-read everything.
+- `orc history [--grep text]` lists earlier runs and asks. `orc show <run>|<run>/<task>|<ask-id>` re-reads one of them, with thread ids and every finding.
 
 ## 5. Report (always, also for Solo work)
 

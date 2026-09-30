@@ -14,7 +14,7 @@
 Claude Code (desktop) — Opus 5.5 lead
   plugin "orc": skill orchestrate (SKILL.md ≈90 lines; 2 reference files loaded on demand) + skill delegate
   statusLine → `python3 ~/.orc/app/orc statusline` (installed by `orc setup`) ──► ~/.orc/claude/<session>.json  (cost, limits, transcript path)
-  Bash ──► orc check | run (background) | steer | merge | report
+  Bash ──► orc check | run (background) | steer | merge | report | ask [--continue] | history | show
                  │
                  ▼
 orc (one stdlib Python file, bundled at plugin/skills/orchestrate/scripts/orc)
@@ -80,6 +80,15 @@ Deep research is a flag on `ask`, not a plan feature. Research needs no worktree
 
 Each consult is appended to `.orc/asks/asks.jsonl` with its usage and cost. `orc report` includes this session's consults as `ask ×N` and `research ×N` rows.
 
+## Follow-ups and history
+
+Every Codex call keeps its thread, and each run or ask records the thread id, so earlier work can be continued warm instead of re-explained. A warm resume is several times cheaper than a cold worker re-reading the code (research/findings.md).
+
+- **Ask follow-ups**: `orc ask --continue <ask-id|last> "…"` resumes the ask's thread with only the new question, keeping its model, effort and web/research mode unless overridden. Research follow-ups keep the report format and still print only the summary. Each ask records `parent` and `root`, so a conversation can be replayed. The footer prints the ask id.
+- **Questions to a worker**: `orc ask --continue <run>/<task> "…"` resumes a task's own thread (never a verifier's) read-only, with no output schema. It runs in the task's worktree if that still exists, and otherwise in the repo. The prompt says where the worker's changes are. The task's state is not changed.
+- **Follow-up work**: a plan task with `continues = "<run>/<task>"` or `continues = "<ask-id>"` resumes that thread on its first call. It is otherwise an ordinary task: its own worktree (branched from the plan base, not from the old branch), brief, checks, verifier and repairs. A preamble names the new working directory and says whether the earlier commits are in it (`git merge-base --is-ancestor`), since the thread remembers an old worktree path. `steer` still refuses merged and stale tasks, because their branch is final, and it points to `continues` instead. The resolved sources are stored in the run's `state.json` under `continues`, so `resume` can find them. A plan may not give one thread to two tasks, because concurrent resumes of one thread would interleave. An implementer may not continue a thread that used web search, for the same reason `web` is read-only (see Security).
+- **History**: `orc history` lists runs and ask conversations, newest first, with one line per run for task statuses and follow-up counts for asks. `--grep` also searches plans, results, prompts and answers. `orc show` prints a run's summary, a task's full result (all findings, changes, claims, thread id, where its code is), or an ask conversation from its root.
+
 Model short names live in `MODEL_ALIASES`: `sol` → `gpt-6.1-sol`, `luna` → `gpt-6-luna`. Update them when OpenAI ships new versions.
 
 ## Principles → mechanisms
@@ -122,7 +131,8 @@ Everything is tested against a fake `codex` (`tests/fake_codex.py`), because Cod
 8. **Status line.** `rate_limits` appears only for Pro and Max plans. On other plans, the Claude limit column shows "n/a".
 9. **Per-turn vs cumulative usage.** orc adds up `turn.completed.usage` for each call. If `codex exec resume` reports the thread's cumulative total instead of the new turn's, repairs and steers are over-counted. Compare one repaired task's numbers with its rollout file's final `total_token_usage`. If they are cumulative, subtract the previous call's total on the same thread in `codex_exec()`.
 10. **`resume` keeps exec flags.** A repair has to keep `-C` (the worktree), `-s workspace-write` and `--output-schema`. Check one repair's events and final JSON.
-11. **Schema metadata.** The schemas carry `$schema` and `title` at the top level. If strict mode rejects them, remove both.
+11. **Resume with a different sandbox, directory or schema.** Follow-ups resume a thread with `-s read-only` and no `--output-schema` (questions to a worker), or with a new `-C` worktree (`continues`). Check that Codex applies the new flags to the resumed turn, and that a worker asked a question answers in prose even though its earlier turns used a JSON schema.
+12. **Schema metadata.** The schemas carry `$schema` and `title` at the top level. If strict mode rejects them, remove both.
 
 ## Deliberate non-goals (for now)
 

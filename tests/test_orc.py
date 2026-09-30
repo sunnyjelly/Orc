@@ -670,6 +670,200 @@ class OrcTest(unittest.TestCase):
         self.assertIsNone(rec["error"])
         self.assertEqual(snapshots, [True])
 
+    # ---- follow-ups and history ----------------------------------------------------------------
+
+    def asks(self):
+        return [json.loads(l) for l in (self.repo / ".orc" / "asks" / "asks.jsonl").read_text().splitlines()]
+
+    def test_ask_follow_up_resumes_the_same_thread(self):
+        self.orc("statusline", stdin=json.dumps({"session_id": "s3", "workspace": {"project_dir": str(self.repo)}}))
+        p = self.orc("ask", "--model", "luna", "--effort", "xhigh", "first question?")
+        first = re.search(r"· ask (\S+)$", p.stdout.strip()).group(1)                 # the footer names the ask
+        self.assertIn("resume=None", p.stdout)
+        p = self.orc("ask", "--continue", first, "and a follow-up?")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        asks = self.asks()
+        self.assertEqual(asks[1]["thread"], asks[0]["thread"])                          # same Codex thread
+        self.assertIn(f"resume={asks[0]['thread']}", p.stdout)
+        self.assertIn("model=gpt-6-luna effort=xhigh", p.stdout)                        # keeps the thread's model and effort
+        self.assertIn(f"(follow-up to {first})", p.stdout)
+        self.assertEqual((asks[1]["parent"], asks[1]["root"]), (first, first))
+        prompt = (self.repo / ".orc" / "asks" / f"{asks[1]['id']}.prompt.md").read_text()
+        self.assertTrue(prompt.startswith("## Follow-up question\nand a follow-up?"))  # no repeated preamble
+        p = self.orc("ask", "--continue", "last", "--model", "sol", "third?")        # `last`; explicit flags still win
+        asks = self.asks()
+        self.assertEqual((asks[2]["parent"], asks[2]["root"], asks[2]["thread"]), (asks[1]["id"], first, asks[0]["thread"]))
+        self.assertIn("model=gpt-6.1-sol effort=xhigh", p.stdout)
+        p = self.orc("ask", "--research", "what changed in X?")
+        research = self.asks()[-1]["id"]
+        p = self.orc("ask", "--continue", research, "dig into Y")
+        self.assertIn("- fake research finding", p.stdout)                              # research follow-ups stay reports
+        self.assertIn("Full report:", p.stdout)
+        self.assertNotIn("long details", p.stdout)
+        p = self.orc("ask", "--continue", "nope", "q")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no ask or run task 'nope'", p.stderr)
+        self.assertIn("| research ×2 |", self.orc("report").stdout)
+
+        # history lists a conversation once, with its follow-ups; show replays it
+        p = self.orc("history")
+        self.assertIn(f"{first}  ", p.stdout)
+        self.assertIn("first question?", p.stdout)
+        self.assertIn("(+2 follow-ups)", p.stdout)
+        self.assertNotIn("third?", p.stdout)
+        self.assertIn("(+1 follow-up)", p.stdout)
+        p = self.orc("history", "--grep", "THIRD")                                        # matches a follow-up, lists its root
+        self.assertIn("first question?", p.stdout)
+        self.assertNotIn("what changed", p.stdout)
+        p = self.orc("show", asks[2]["id"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for text in ("first question?", "and a follow-up?", "third?", f"Continue: `orc ask --continue {asks[2]['id']}"):
+            self.assertIn(text, p.stdout)
+        self.assertEqual(p.stdout.count("A: fake answer"), 3)
+
+    def test_ask_a_finished_worker_about_its_work(self):
+        self.plan("q.toml", """
+            goal = "ask a worker"
+            checks = ["true"]
+            [[task]]
+            id = "impl-a"
+            role = "implementer"
+            why = "w"
+            brief = "b"
+            acceptance = ["ok"]
+            verify = "checks"
+        """)
+        self.assertEqual(self.orc("run", "q.toml").returncode, 0)
+        run_id, st = self.state()
+        thread = st["tasks"]["impl-a"]["calls"][0]["thread"]
+        p = self.orc("ask", "--continue", f"{run_id}/impl-a", "why this approach?")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(f"[cwd=impl-a sandbox=read-only resume={thread}]", p.stdout)     # its worktree, read-only
+        prompt = (self.repo / ".orc" / "asks" / f"{self.asks()[-1]['id']}.prompt.md").read_text()
+        self.assertIn("not a new task", prompt)
+        self.assertIn("plain prose, not JSON", prompt)
+        self.orc("merge", run_id)                                                         # worktree removed after merge
+        p = self.orc("ask", "--continue", f"{run_id}/impl-a", "and now?")
+        self.assertIn("[cwd=repo sandbox=read-only", p.stdout)
+        self.assertIn("contains your merged changes", (self.repo / ".orc" / "asks" / f"{self.asks()[-1]['id']}.prompt.md").read_text())
+        p = self.orc("history")
+        self.assertIn(f"→ {run_id}/impl-a", p.stdout)
+        self.assertIn("impl-a checks-passed (merged)", p.stdout)
+        p = self.orc("show", f"{run_id}/impl-a")
+        self.assertIn(f"thread {thread}", p.stdout)
+        self.assertIn("brief: b", p.stdout)
+        self.assertIn(f'`continues = "{run_id}/impl-a"`', p.stdout)
+        p = self.orc("show", run_id)
+        self.assertIn("✓ impl-a", p.stdout)
+        self.assertIn(f"orc show {run_id}/<task>", p.stdout)
+        self.assertIn(f"Questions to {run_id}/impl-a", self.orc("show", self.asks()[-1]["id"]).stdout)
+
+    FOLLOW = """
+        goal = "follow-up work"
+        checks = ["true"]
+        [[task]]
+        id = "more"
+        role = "implementer"
+        continues = "{ref}"
+        why = "w"
+        brief = "extend it"
+        acceptance = ["ok"]
+        verify = "checks"
+    """
+
+    def test_new_plan_continues_a_merged_workers_thread(self):
+        self.plan("a.toml", """
+            goal = "first"
+            checks = ["true"]
+            [[task]]
+            id = "impl-a"
+            role = "implementer"
+            why = "w"
+            brief = "b"
+            acceptance = ["ok"]
+            verify = "checks"
+        """)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, st = self.state()
+        thread = st["tasks"]["impl-a"]["calls"][0]["thread"]
+        self.assertEqual(self.orc("merge", run_a).returncode, 0)
+        p = self.orc("steer", run_a, "impl-a", "more")
+        self.assertIn(f'continues = "{run_a}/impl-a"', p.stderr)                          # steer points to the new route
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        p = self.orc("check", "b.toml")
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn(f"· ↻ {run_a}/impl-a |", p.stdout)
+        p = self.orc("run", "b.toml")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        run_b, st = self.state()
+        more = st["tasks"]["more"]
+        self.assertEqual(more["calls"][0]["thread"], thread)                               # warm thread, resumed
+        self.assertEqual(more["continues"], f"{run_a}/impl-a")
+        self.assertTrue((Path(more["worktree"]) / "impl-a.txt").exists())                  # fresh worktree from HEAD
+        self.assertTrue(more["worktree"].endswith("/more"))
+        prompt = (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text()
+        self.assertTrue(prompt.startswith(f"## Follow-up to your earlier work ({run_a}/impl-a)"))
+        self.assertIn("are already in this checkout", prompt)
+        self.assertIn("## Your task: more\nextend it", prompt)
+        self.assertEqual(self.orc("merge", run_b).returncode, 0)
+        self.assertTrue((self.repo / "more.txt").exists())
+
+    def test_continues_unmerged_work_and_ask_threads_and_rejects_bad_refs(self):
+        self.plan("a.toml", """
+            goal = "first"
+            checks = ["true"]
+            [[task]]
+            id = "impl-a"
+            role = "implementer"
+            why = "w"
+            brief = "b"
+            acceptance = ["ok"]
+            verify = "checks"
+        """)
+        self.orc("run", "a.toml")
+        run_a, _ = self.state()
+        self.orc("ask", "design it?")
+        ask_id = self.asks()[-1]["id"]
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a") + """
+            [[task]]
+            id = "look"
+            role = "explorer"
+            continues = "ASK"
+            why = "w"
+            brief = "look again"
+        """.replace("ASK", ask_id))
+        p = self.orc("run", "b.toml")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        run_b, st = self.state()
+        prompt = (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text()
+        self.assertIn(f"NOT in this checkout (they are on orc/{run_a}/impl-a", prompt)
+        self.assertEqual(st["tasks"]["look"]["calls"][0]["thread"], self.asks()[-1]["thread"])
+        self.assertIn("read-only consultant", (self.repo / ".orc" / "runs" / run_b / "look" / "worker.prompt.md").read_text())
+        for ref, err in ((f"{run_a}/nope", "no task nope"), ("20990101-000000/x", "no run 20990101-000000"),
+                         ("0101-000000-000", "no ask or run task"), ("bad ref!", "`continues` must be")):
+            self.plan("c.toml", self.FOLLOW.replace("{ref}", ref))
+            p = self.orc("check", "c.toml")
+            self.assertEqual(p.returncode, 1, ref)
+            self.assertIn(err, p.stdout)
+        self.plan("d.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a") + """
+            [[task]]
+            id = "again"
+            role = "explorer"
+            continues = "REF"
+            why = "w"
+            brief = "b"
+        """.replace("REF", f"{run_a}/impl-a"))
+        p = self.orc("check", "d.toml")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("continue the same Codex thread", p.stdout)
+        self.orc("ask", "--web", "look it up")                                            # web context never reaches a writer
+        self.plan("e.toml", self.FOLLOW.replace("{ref}", self.asks()[-1]["id"]))
+        p = self.orc("check", "e.toml")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("can't continue a web-search thread", p.stdout)
+        self.plan("f.toml", self.FOLLOW.replace("{ref}", self.asks()[-1]["id"]).replace('role = "implementer"', 'role = "explorer"'))
+        self.assertEqual(self.orc("check", "f.toml").returncode, 0)
+
 
 class PackagingTest(unittest.TestCase):
     def test_dist_skills_match_sources(self):
