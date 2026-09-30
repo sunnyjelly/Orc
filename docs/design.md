@@ -49,7 +49,7 @@ A consult is a single read-only Codex call that runs in the foreground, with no 
 - **Quick lookup**: `--web` turns on Codex live web search (`-c web_search="live"`).
 - **Deep research**: `--research`. A research preamble makes one agentic call search, cross-check and write a cited Markdown report to `.orc/asks/<id>.final.md`. The lead gets only the `## Summary` section and the file path.
 
-The default model is **GPT-6 Luna at high effort**, which is cheap enough to use freely; Luna at low effort is too weak to be useful. Luna is never used for implementation or verification.
+The default model is **GPT-6.1 Sol at high effort**, the preferred model everywhere. `--model luna` (GPT-6 Luna, about 20× cheaper per token) is opt-in for simple lookups; use it at high effort, since Luna at low effort is too weak to be useful. Luna is never used for implementation or verification.
 
 Deep research is a flag on `ask`, not a plan feature. Research needs no worktrees, checks or merges, and one agentic call already runs many searches. For broad research that splits into independent areas, a plan with several `web = true` explorers does it in parallel.
 

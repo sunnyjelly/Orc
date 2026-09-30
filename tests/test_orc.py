@@ -145,19 +145,19 @@ class OrcTest(unittest.TestCase):
         self.orc("statusline", stdin=json.dumps({"session_id": "s2", "workspace": {"project_dir": str(self.repo)}}))
         p = self.orc("ask", "is this design sound?")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("fake answer (model=gpt-6-luna effort=high web=False)", p.stdout)  # Luna at high by default
-        self.assertIn("— luna · high ·", p.stdout)
-        p = self.orc("ask", "--model", "sol", "--effort", "xhigh", "--web", "second opinion?")
-        self.assertIn("model=gpt-6.1-sol effort=xhigh web=True", p.stdout)
+        self.assertIn("fake answer (model=gpt-6.1-sol effort=high web=False)", p.stdout)  # Sol at high by default
+        self.assertIn("— sol · high ·", p.stdout)
+        p = self.orc("ask", "--model", "luna", "--effort", "xhigh", "--web", "quick lookup?")
+        self.assertIn("model=gpt-6-luna effort=xhigh web=True", p.stdout)
         p = self.orc("ask", "--research", "what changed in X?")
-        self.assertIn("- fake research finding (model=gpt-6-luna effort=high web=True)", p.stdout)
+        self.assertIn("- fake research finding (model=gpt-6.1-sol effort=high web=True)", p.stdout)
         self.assertNotIn("long details", p.stdout)  # only the summary reaches the lead
         report_path = p.stdout.split("Full report: ")[1].splitlines()[0]
         self.assertIn("long details", Path(report_path).read_text())
         rep = self.orc("report").stdout
-        self.assertIn("| ask ×1 | luna · high | 1 ok | 1 |", rep)
-        self.assertIn("| ask ×1 | sol · xhigh | 1 ok | 1 |", rep)
-        self.assertIn("| research ×1 | luna · high | 1 ok | 1 |", rep)
+        self.assertIn("| ask ×1 | sol · high | 1 ok | 1 |", rep)
+        self.assertIn("| ask ×1 | luna · xhigh | 1 ok | 1 |", rep)
+        self.assertIn("| research ×1 | sol · high | 1 ok | 1 |", rep)
         self.assertIn("gpt-6-luna, gpt-6.1-sol, ChatGPT plan):** 3 calls", rep)
 
     def test_plan_model_alias_and_web(self):

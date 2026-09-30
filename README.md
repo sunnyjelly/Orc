@@ -4,7 +4,7 @@ Claude Code (Opus 5.5) acts as the lead engineer. It delegates work to OpenAI Co
 
 ```
 you ──► Opus 5.5 (lead, skill "orchestrate")
-          ├─ `orc ask`: second opinion · web lookup · --research   (Luna high by default, or Sol)
+          ├─ `orc ask`: second opinion · web lookup · --research   (Sol 6.1 high by default; Luna optional)
           ├─ triage: solo │ one worker │ team of 2–4
           ├─ plan.toml ──► `orc check`  → plan table for you to approve
           ├─ `orc run` (one background call)
@@ -65,7 +65,7 @@ Open any git repo in Claude Code and ask for work as usual. Set the model to Opu
 
 | Command | What it does |
 |---|---|
-| `orc ask [--model luna\|sol] [--effort E] [--web] [--research] "Q"` | Quick read-only consult (default Luna at high effort): a second opinion, lookup, or web research. `--research` saves a cited report to `.orc/asks/` and prints only its summary. |
+| `orc ask [--model sol\|luna] [--effort E] [--web] [--research] "Q"` | Quick read-only consult (default GPT-6.1 Sol at high effort): a second opinion, lookup, or web research. `--research` saves a cited report to `.orc/asks/` and prints only its summary. |
 | `orc check PLAN` | Validates the plan (roles, acceptance criteria, file ownership, cycles) and prints the plan table, estimated Codex calls and current limits. No Codex calls. |
 | `orc run PLAN [--only a,b]` | Runs the plan. Prints progress to stderr and a compact summary to stdout. Exit 0 if everything passed, 2 otherwise. |
 | `orc steer RUN TASK "msg"` | Follow-up on a task's own Codex thread (warm context), then re-check and re-verify. |

@@ -1182,7 +1182,7 @@ def main(argv=None) -> int:
     p.add_argument("--all", action="store_true")
     p = sub.add_parser("ask", help="quick read-only consult: second opinion, lookup, or --research (web) report")
     p.add_argument("question", help="the question, or - to read it from stdin")
-    p.add_argument("--model", default="luna", help="luna (default), sol, or a full model id")
+    p.add_argument("--model", default="sol", help="sol (default, GPT-6.1 Sol), luna (cheaper), or a full model id")
     p.add_argument("--effort", default="high", choices=EFFORTS)
     p.add_argument("--web", action="store_true", help="enable live web search")
     p.add_argument("--research", action="store_true", help="multi-source web research; full report to a file, summary printed")
