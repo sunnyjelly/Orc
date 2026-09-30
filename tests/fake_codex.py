@@ -16,6 +16,8 @@ import fcntl
 import json
 import os
 import sys
+import time
+import tomllib
 import uuid
 from pathlib import Path
 
@@ -33,6 +35,14 @@ def opt(name):
 out, schema, sandbox, cwd = opt("-o"), opt("--output-schema"), opt("-s"), Path(opt("-C") or ".")
 resume = args[args.index("resume") + 1] if "resume" in args else None
 prompt = sys.stdin.read()
+if "FAKE_HOLD" in prompt:
+    gate = Path(os.environ["ORC_FAKE_GATE"])
+    gate.with_suffix(".ready").touch()
+    deadline = time.monotonic() + 20
+    while not gate.with_suffix(".release").exists():
+        if time.monotonic() >= deadline:
+            sys.exit("test did not release fake Codex")
+        time.sleep(0.01)
 if resume and cwd.name == "impl-a":
     import time
     time.sleep(1.5)  # keep impl-a mid-repair while impl-b finishes (scheduler regression test)
@@ -43,6 +53,13 @@ lock = open(home / "fake.lock", "w")
 fcntl.flock(lock, fcntl.LOCK_EX)  # parallel fake workers share the state file
 st = json.loads(state.read_text()) if state.exists() else {"calls": 0, "verifier_failed": False}
 st["calls"] += 1
+config = home / "config.toml"
+search = tomllib.loads(config.read_text()).get("web_search", "cached") if config.exists() else "cached"
+for arg in args:
+    if arg.startswith("web_search="):
+        search = arg.split("=", 1)[1].strip('"')
+st.setdefault("invocations", []).append({"thread": thread, "resume": resume, "cwd": str(cwd),
+                                        "sandbox": sandbox, "web_search": search})
 
 print(json.dumps({"type": "thread.started", "thread_id": thread}))
 print(json.dumps({"type": "turn.started"}))
@@ -50,7 +67,7 @@ print(json.dumps({"type": "turn.started"}))
 if schema is None:  # orc ask: plain-text answer that echoes how it was called
     model = opt("-m")
     effort = next(a.split("=", 1)[1].strip('"') for a in args if a.startswith("model_reasoning_effort="))
-    web = 'web_search="live"' in args
+    web = search != "disabled"
     info = f"model={model} effort={effort} web={web}"
     if "## Disagreements and uncertainty" in prompt:
         final = f"## Summary\n- fake research finding ({info})\n\n## Details\nlong details\n\n## Sources\n1. https://example.com\n"

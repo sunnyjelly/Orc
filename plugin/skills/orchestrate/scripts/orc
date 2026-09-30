@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+from contextlib import ExitStack, contextmanager
 import datetime as dt
+import errno
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -120,6 +123,102 @@ def read_jsonl(path: Path) -> list[dict]:
         if isinstance(obj, dict):
             out.append(obj)
     return out
+
+
+class LockBusy(RuntimeError):
+    pass
+
+
+def lock_file(f, wait: bool) -> None:
+    if os.name == "nt":
+        import msvcrt
+        f.seek(0)
+        while True:
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as e:
+                if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                if not wait:
+                    raise LockBusy("another operation is running right now; wait until it finishes") from e
+                time.sleep(0.05)
+    else:
+        import fcntl
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError as e:
+            raise LockBusy("another operation is running right now; wait until it finishes") from e
+
+
+def unlock_file(f) -> None:
+    if os.name == "nt":
+        import msvcrt
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
+@contextmanager
+def file_lock(path: Path, wait: bool = True):
+    """An OS lock: released even on process death. Never unlink its shared inode."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as f:
+        if path.stat().st_size == 0:
+            f.write(b"\0")  # Windows byte-range locks need a byte to lock
+            f.flush()
+        lock_file(f, wait)
+        try:
+            yield
+        finally:
+            unlock_file(f)
+
+
+def thread_lock_path(repo: Path | None, thread: str) -> Path:
+    return orc_dir(repo) / "locks" / (hashlib.sha256(thread.encode()).hexdigest() + ".lock")
+
+
+def thread_reserved(repo: Path | None, thread: str) -> bool:
+    """Read-only availability probe, including for `orc check` (creates no files)."""
+    path = thread_lock_path(repo, thread)
+    if not path.exists():
+        return False
+    with open(path, "r+b") as f:
+        try:
+            lock_file(f, False)
+        except LockBusy:
+            return True
+        unlock_file(f)
+    return False
+
+
+@contextmanager
+def thread_turn(repo: Path | None, thread: str | None, owner: str | None = None, writes: bool = False):
+    """Validate and reserve a resumed thread under the same lock used to transfer ownership."""
+    if not thread:
+        yield
+        return
+    with ExitStack() as turn:
+        with file_lock(orc_dir(repo) / "locks" / "ownership.lock"):
+            web, current, busy = thread_history(repo, thread)
+            if current and current != owner:
+                raise RuntimeError(f"thread was continued by {current}; use {current} instead")
+            # A worker's status stays running between its calls; only its own process may proceed.
+            if busy and not (owner and task_running_here(repo, owner) and not thread_reserved(repo, thread)):
+                raise LockBusy("thread is running right now; wait until it finishes")
+            if writes and web:
+                raise RuntimeError("thread has seen web search results, so it can't resume with write access; re-plan")
+            turn.enter_context(file_lock(thread_lock_path(repo, thread), wait=False))
+        yield
+
+
+def task_running_here(repo: Path | None, owner: str) -> bool:
+    run_id, _, tid = owner.partition("/")
+    st = read_json(orc_dir(repo) / "runs" / run_id / "state.json", {})
+    rec = state_tasks(st).get(tid, {})
+    return rec.get("status") == "running" and rec.get("pid") == os.getpid()
 
 
 def add_usage(a: dict, b: dict) -> dict:
@@ -574,8 +673,7 @@ def codex_exec(*, model: str, effort: str, sandbox: str, cwd: Path, prompt: str,
     cmd += ["-m", model, "-c", f'model_reasoning_effort="{effort}"', "-s", sandbox, "-C", str(cwd), "--skip-git-repo-check"]
     if sandbox == "workspace-write" and network:
         cmd += ["-c", "sandbox_workspace_write.network_access=true"]
-    if web:
-        cmd += ["-c", 'web_search="live"']
+    cmd += ["-c", 'web_search="live"' if web else 'web_search="disabled"']
     if resume:
         cmd += ["resume", resume]
     cmd.append("-")
@@ -648,10 +746,11 @@ class Run:
 
     def codex(self, task: dict, name: str, prompt: str, schema: str, cwd: Path, sandbox: str,
               resume: str | None = None, effort: str | None = None) -> dict:
-        return codex_exec(model=task["model"], effort=effort or task["effort"], sandbox=sandbox, cwd=cwd, prompt=prompt,
-                          logdir=self.dir / task["id"], name=name, schema=schema, resume=resume,
-                          network=task["network"], web=task["web"], timeout_min=task["timeout_min"],
-                          slots=self.slots, quota_stop=self.quota_stop, pricing=self.pricing)
+        with thread_turn(self.repo, resume, f"{self.id}/{task['id']}", writes=sandbox == "workspace-write"):
+            return codex_exec(model=task["model"], effort=effort or task["effort"], sandbox=sandbox, cwd=cwd, prompt=prompt,
+                              logdir=self.dir / task["id"], name=name, schema=schema, resume=resume,
+                              network=task["network"], web=task["web"], timeout_min=task["timeout_min"],
+                              slots=self.slots, quota_stop=self.quota_stop, pricing=self.pricing)
 
     # ------------------------------------------------------------ prompts
 
@@ -754,28 +853,44 @@ class Run:
         tdir = self.dir / t["id"]
         tdir.mkdir(parents=True, exist_ok=True)
         rec = self.state["tasks"].get(t["id"], {})
-        rec.update(id=t["id"], role=t["role"], effort=t["effort"], model=t["model"], verify=t["verify"],
-                   status="running", pid=os.getpid(), web=t["web"], started=now_iso(), error=None)
+        rec.setdefault("id", t["id"])
+        rec.setdefault("role", t["role"])
         if t["continues"]:
             rec["continues"] = t["continues"]
         rec.setdefault("calls", [])
         self.state["tasks"][t["id"]] = rec
-        self.save()
-        self.log(f"▶ {t['id']} ({t['role']}, {t['effort']})")
         try:
+            with file_lock(orc_dir(self.repo) / "locks" / "ownership.lock"):
+                thread = task_thread(rec) or (self.continued(t) or {}).get("thread")
+                if thread:
+                    web, owner, busy = thread_history(self.repo, thread)
+                    if owner and owner != f"{self.id}/{t['id']}":
+                        raise RuntimeError(f"thread was continued by {owner}; use {owner} instead")
+                    if busy:
+                        raise LockBusy("thread is running right now; wait until it finishes")
+                    if t["writes"] and web:
+                        raise RuntimeError("thread has used web search, so it can't resume with write access; re-plan")
+                rec.update(id=t["id"], role=t["role"], effort=t["effort"], model=t["model"], verify=t["verify"],
+                           status="running", pid=os.getpid(), web=t["web"], started=now_iso(), error=None)
+                self.save()
+            self.log(f"▶ {t['id']} ({t['role']}, {t['effort']})")
             if t["writes"]:
                 self.implement(t, rec, tdir)
             else:
                 cwd = self.repo or Path.cwd()
                 if t.get("base_writer"):
                     cwd = Path(self.state["tasks"][t["base_writer"]]["worktree"])  # see the code it builds on
+                rec["cwd"] = str(cwd)
+                self.save()
                 name = f"worker{len(rec['calls'])}" if rec["calls"] else "worker"
-                resume = (task_thread(rec) or self.continued(t)["thread"]) if self.continued(t) else None
+                resume = task_thread(rec) or (self.continued(t) or {}).get("thread")
                 call = self.codex(t, name, self.worker_prompt(t, cwd), "worker-result", cwd, "read-only", resume=resume)
                 rec["calls"].append(call)
                 rec["result"] = call["final"]
                 rec["status"] = call["final"]["status"] if call_succeeded(call) else ("skipped" if call.get("skipped") else "error")
                 rec["error"] = None if call_succeeded(call) else call["error"]
+        except LockBusy as e:
+            rec["status"], rec["error"] = "skipped", str(e)  # recoverable once the other turn finishes
         except Exception as e:  # keep other tasks running
             rec["status"], rec["error"] = "error", f"{type(e).__name__}: {e}"
         rec["finished"] = now_iso()
@@ -799,6 +914,9 @@ class Run:
             rec.update(branch=branch, worktree=str(wt), base=base, parent=parent)
             self.save()
 
+        rec["cwd"] = str(wt)
+        self.save()
+
         thread = task_thread(rec) or (self.continued(t) or {}).get("thread")
         if self.continued(t) and thread_history(self.repo, thread)[0]:  # re-check: `resume` may run long after `check`
             raise RuntimeError(f"the thread of {t['continues']} has used web search, so it can't resume with write access; re-plan")
@@ -806,6 +924,7 @@ class Run:
         call = self.codex(t, name, self.worker_prompt(t, wt), "worker-result", wt, "workspace-write", resume=thread)
         rec["calls"].append(call)
         rec["result"], thread = call["final"], call["thread"]
+        self.save()  # publish the worker thread before checks and repairs
         if not call_succeeded(call):
             rec["status"], rec["error"] = ("skipped" if call.get("skipped") else "error"), call["error"]
             self.commit(t, wt, f"orc({t['id']}): partial work")
@@ -908,6 +1027,70 @@ class Run:
 OK_STATUSES = ("done", "verified", "checks-passed")
 
 
+def display_task(rec, tid: str) -> dict | None:
+    """Validate the nested fields consumed by history rendering; ignore corrupt unrelated tasks."""
+    if not isinstance(rec, dict) or not isinstance(rec.get("status"), str):
+        return None
+    r = {"id": tid, **rec}
+    for key in ("id", "role", "effort", "model", "diffstat", "error", "branch", "worktree", "cwd", "continues"):
+        if r.get(key) is not None and not isinstance(r[key], str):
+            return None
+    for key in ("calls", "checks", "verdicts"):
+        if r.get(key) is None:
+            r[key] = []
+        if not isinstance(r[key], list) or any(not isinstance(x, dict) for x in r[key]):
+            return None
+    def strings(obj, keys):
+        return all(isinstance(obj.get(k, ""), str) for k in keys)
+
+    def numeric(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and abs(value) < float("inf")
+
+    for c in r["calls"]:
+        if not strings(c, ("name",)) or not isinstance(c.get("usage") or {}, dict):
+            return None
+        if any(not numeric(c.get(k) or 0) for k in ("cost", "seconds")):
+            return None
+        if any(not numeric((c.get("usage") or {}).get(k) or 0) for k in USAGE_KEYS):
+            return None
+        if c.get("thread") is not None and not isinstance(c["thread"], str):
+            return None
+        c.setdefault("name", "?")
+    for c in r["checks"]:
+        if not numeric(c.get("exit")) or not strings(c, ("cmd", "tail")):
+            return None
+        c.setdefault("cmd", "?")
+        c.setdefault("tail", "")
+    for v in r["verdicts"]:
+        if not strings(v, ("kind", "verdict", "summary")) or not isinstance(v.get("issues", []), list):
+            return None
+        if any(not isinstance(i, dict) or not strings(i, ("severity", "location", "problem")) for i in v.get("issues", [])):
+            return None
+        v.setdefault("kind", "?")
+        v.setdefault("verdict", "uncertain")
+        for i in v.get("issues", []):
+            for k in ("severity", "location", "problem"):
+                i.setdefault(k, "?")
+    res = r.get("result")
+    if res is None:
+        res = {}
+    if not isinstance(res, dict) or not strings(res, ("summary",)):
+        return None
+    for key in ("findings", "claims", "open_questions"):
+        if not isinstance(res.get(key, []), list) or any(not isinstance(x, str) for x in res.get(key, [])):
+            return None
+    if not isinstance(res.get("changes", []), list) or any(not isinstance(c, dict) or not strings(c, ("path", "what"))
+                                                         for c in res.get("changes", [])):
+        return None
+    r["result"] = res
+    return r
+
+
+def state_order(st: dict) -> list[str]:
+    order = st.get("order")
+    return [tid for tid in order if isinstance(tid, str)] if isinstance(order, list) else []
+
+
 def task_line(r: dict, max_findings: int = 10, run_id: str = "<run>") -> list[str]:
     mark = "✓" if r["status"] in OK_STATUSES else ("~" if r["status"] in ("partial", "uncertain", "unverified") else "✗")
     usage = {k: 0 for k in USAGE_KEYS}
@@ -952,9 +1135,9 @@ def task_line(r: dict, max_findings: int = 10, run_id: str = "<run>") -> list[st
 
 
 def run_summary(run_dir: Path, state: dict) -> str:
-    tasks = state.get("tasks", {})
+    tasks = {tid: r for tid, rec in state_tasks(state).items() if (r := display_task(rec, tid)) is not None}
     out = [f"orc run {state['id']} — {state['goal']}", ""]
-    for tid in state["order"]:
+    for tid in state_order(state):
         if tid in tasks:
             out += task_line(tasks[tid], run_id=state["id"])
     calls = [c for r in tasks.values() for c in r.get("calls", [])]
@@ -965,7 +1148,7 @@ def run_summary(run_dir: Path, state: dict) -> str:
     out += ["", f"Codex: {len(calls)} calls · {fmt_tok(usage['input_tokens'])} in ({fmt_tok(usage['cached_input_tokens'])} cached) / "
                 f"{fmt_tok(usage['output_tokens'])} out · ≈${cost:.2f} API-equiv · "
                 f"{fmt_windows(codex_windows(read_json(ORC_HOME / 'codex-limits.json')), codex_windows(state.get('codex_start')))}"]
-    ok = [t for t in state["order"] if tasks.get(t, {}).get("status") in ("verified", "checks-passed") and tasks[t].get("branch")]
+    ok = [t for t in state_order(state) if tasks.get(t, {}).get("status") in ("verified", "checks-passed") and tasks[t].get("branch")]
     if ok:
         out.append(f"Next: review the summary above, then `orc merge {state['id']}` to merge {', '.join(ok)}.")
     if state.get("risk") == "high":
@@ -1030,7 +1213,7 @@ def run_states(repo: Path | None) -> list[tuple[Path, dict]]:
 
 
 def state_tasks(st: dict) -> dict:
-    return {k: v for k, v in st.get("tasks").items() if isinstance(v, dict)} if isinstance(st.get("tasks"), dict) else {}
+    return {k: v for k, v in st.get("tasks").items() if isinstance(v, dict)} if isinstance(st, dict) and isinstance(st.get("tasks"), dict) else {}
 
 
 def plan_task(run_dir: Path, tid: str) -> dict | None:
@@ -1039,7 +1222,7 @@ def plan_task(run_dir: Path, tid: str) -> dict | None:
         tasks = tomllib.loads((run_dir / "plan.toml").read_text()).get("task", [])
     except (OSError, tomllib.TOMLDecodeError):
         return None
-    return next((t for t in tasks if isinstance(t, dict) and t.get("id") == tid), {})
+    return next((t for t in tasks if isinstance(t, dict) and t.get("id") == tid), {}) if isinstance(tasks, list) else None
 
 
 def find_ask(asks: list[dict], ref: str, sid: str | None = None) -> dict | None:
@@ -1047,6 +1230,12 @@ def find_ask(asks: list[dict], ref: str, sid: str | None = None) -> dict | None:
     if ref != "last":
         return next((x for x in reversed(asks) if x.get("id") == ref), None)
     return next((x for x in reversed(asks) if x.get("thread") and (not sid or x.get("claude_session") == sid)), None)
+
+
+def history_asks(path: Path) -> list[dict]:
+    return [x for x in read_jsonl(path) if isinstance(x.get("id"), str)
+            and all(x.get(k) is None or isinstance(x[k], str)
+                    for k in ("root", "parent", "question", "at", "model", "effort", "thread", "error"))]
 
 
 def thread_history(repo: Path | None, thread: str) -> tuple[bool, str | None, bool]:
@@ -1074,13 +1263,13 @@ def thread_history(repo: Path | None, thread: str) -> tuple[bool, str | None, bo
             else:  # not started yet, or run by an older orc: ask the plan, and assume the worst if it's unreadable
                 entry = plan_task(run_dir, tid)
                 web = web or entry is None or bool(entry.get("web"))
-    return web, owner, busy
+    return web, owner, busy or thread_reserved(repo, thread)
 
 
 def thread_source(repo: Path | None, ref: str) -> dict | str:
     """The Codex thread behind `<run>/<task>` or an ask id, for a follow-up; an error string if there is none."""
     if "/" not in ref:
-        x = find_ask(read_jsonl(asks_dir(repo) / "asks.jsonl"), ref)
+        x = find_ask(history_asks(asks_dir(repo) / "asks.jsonl"), ref)
         if not x:
             return f"no ask or run task {ref!r} (use an ask id or <run>/<task>; see `orc show`)"
         if "/" in (x.get("root") or ""):  # a question to a worker: continue as a question to that worker
@@ -1088,6 +1277,8 @@ def thread_source(repo: Path | None, ref: str) -> dict | str:
             return {**src, "ref": x["id"]} if isinstance(src, dict) else src
         if not x.get("thread"):
             return f"ask {ref} has no Codex thread to continue (it failed before starting)"
+        if thread_history(repo, x["thread"])[2]:
+            return f"ask {ref} is running right now; wait until it finishes"
         return {"ref": x["id"], "root": x.get("root") or x["id"], "kind": "ask", "thread": x["thread"], "model": x.get("model"),
                 "effort": x.get("effort"), "web": x.get("web"), "research": x.get("research")}
     run_id, _, tid = ref.partition("/")
@@ -1109,7 +1300,17 @@ def thread_source(repo: Path | None, ref: str) -> dict | str:
     head = (git("rev-parse", "--verify", "-q", f"{branch}^{{commit}}", cwd=repo, check=False) if branch and repo else "")
     return {"ref": ref, "root": ref, "kind": "task", "thread": thread, "model": rec.get("model"), "effort": rec.get("effort"),
             "role": rec.get("role"), "branch": branch, "head": head or rec.get("merged_head"), "merged": bool(rec.get("merged")),
-            "worktree": rec.get("worktree"), "web": web}
+            "worktree": rec.get("cwd") or rec.get("worktree") or dependency_checkout(run_dir, state, tid), "web": web}
+
+
+def dependency_checkout(run_dir: Path, state: dict, tid: str) -> str | None:
+    """Recover the checkout for read-only workers recorded before `cwd` was persisted."""
+    plan, errs, _ = load_plan(run_dir / "plan.toml")
+    if errs:
+        return None
+    task = next((t for t in plan["task"] if t["id"] == tid), {})
+    parent = state_tasks(state).get(task.get("base_writer"), {})
+    return parent.get("worktree")
 
 
 def resolve_continues(plan: dict, repo: Path | None) -> tuple[list[str], list[str], dict]:
@@ -1162,44 +1363,47 @@ def cmd_check(a) -> int:
 def cmd_run(a) -> int:
     plan, errs, warns = load_plan(a.plan)
     repo = repo_root()
-    continues = {}
-    if not errs:
-        cerrs, cwarns, continues = resolve_continues(plan, repo)
-        errs += cerrs
-        for w in cwarns:
-            print(f"warning: {w}", file=sys.stderr)
-    if errs:
-        print("plan is invalid:\n" + "\n".join(f"- {e}" for e in errs))
-        return 1
-    if any(t["writes"] for t in plan["task"]) and not repo:
-        die("implementer tasks need a git repository")
-    base = git("rev-parse", plan.get("base", "HEAD"), cwd=repo) if repo else None
-    run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    for n in range(2, 100):  # two runs in the same second get a suffix
-        run_dir = runs_dir(repo) / run_id
-        try:
-            run_dir.mkdir(parents=True)
-            break
-        except FileExistsError:
-            run_id = f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{n}"
-    (run_dir / "plan.toml").write_text(Path(a.plan).read_text())
-    codex_start = codex_limits()
-    save_codex_limits(codex_start)
-    claude = claude_snapshot(repo)
-    state = {"id": run_id, "goal": plan["goal"], "risk": plan["risk"], "base": base, "started": now_iso(),
-             "order": [t["id"] for t in plan["task"]], "tasks": {}, "codex_start": codex_start,
-             "claude_session": (claude or {}).get("session_id"), "continues": continues}
-    write_json(run_dir / "state.json", state)
-    print(f"orc run {run_id} started ({len(plan['task'])} tasks). Summary follows when all finish.", flush=True)
-    run = Run(plan, repo, run_dir, run_id, base)
-    run.execute(set(a.only.split(",")) if a.only else None)
-    state = run.state
-    state["finished"] = now_iso()
-    write_json(run_dir / "state.json", state)
-    summary = run_summary(run_dir, state)
-    (run_dir / "summary.md").write_text(summary + "\n")
-    print(summary)
-    return 0 if all(r.get("status") in OK_STATUSES for r in state["tasks"].values()) else 2
+    with ExitStack() as operations:
+        with file_lock(orc_dir(repo) / "locks" / "ownership.lock"):
+            continues = {}
+            if not errs:
+                cerrs, cwarns, continues = resolve_continues(plan, repo)
+                errs += cerrs
+                for w in cwarns:
+                    print(f"warning: {w}", file=sys.stderr)
+            if errs:
+                print("plan is invalid:\n" + "\n".join(f"- {e}" for e in errs))
+                return 1
+            if any(t["writes"] for t in plan["task"]) and not repo:
+                die("implementer tasks need a git repository")
+            base = git("rev-parse", plan.get("base", "HEAD"), cwd=repo) if repo else None
+            run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            for n in range(2, 100):  # two runs in the same second get a suffix
+                run_dir = runs_dir(repo) / run_id
+                try:
+                    run_dir.mkdir(parents=True)
+                    break
+                except FileExistsError:
+                    run_id = f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{n}"
+            (run_dir / "plan.toml").write_text(Path(a.plan).read_text())
+            codex_start = codex_limits()
+            save_codex_limits(codex_start)
+            claude = claude_snapshot(repo)
+            state = {"id": run_id, "goal": plan["goal"], "risk": plan["risk"], "base": base, "started": now_iso(),
+                     "order": [t["id"] for t in plan["task"]], "tasks": {}, "codex_start": codex_start,
+                     "claude_session": (claude or {}).get("session_id"), "continues": continues}
+            operations.enter_context(file_lock(run_dir / "command.lock", wait=False))
+            write_json(run_dir / "state.json", state)
+        print(f"orc run {run_id} started ({len(plan['task'])} tasks). Summary follows when all finish.", flush=True)
+        run = Run(plan, repo, run_dir, run_id, base)
+        run.execute(set(a.only.split(",")) if a.only else None)
+        state = run.state
+        state["finished"] = now_iso()
+        write_json(run_dir / "state.json", state)
+        summary = run_summary(run_dir, state)
+        (run_dir / "summary.md").write_text(summary + "\n")
+        print(summary)
+        return 0 if all(r.get("status") in OK_STATUSES for r in state["tasks"].values()) else 2
 
 
 def load_run(repo: Path | None, run_id: str | None) -> "Run":
@@ -1213,78 +1417,89 @@ def load_run(repo: Path | None, run_id: str | None) -> "Run":
 
 def cmd_steer(a) -> int:
     repo = repo_root()
-    run = load_run(repo, a.run)
-    t = next((x for x in run.plan["task"] if x["id"] == a.task), None)
-    rec = run.state.get("tasks", {}).get(a.task)  # the Run's own state: this is what save() writes
-    if not t or not rec:
-        die(f"unknown task {a.task} in run {run.id}")
-    thread = task_thread(rec)
-    web, owner, busy = thread_history(repo, thread) if thread else (False, None, False)
-    if owner and owner != f"{run.id}/{a.task}":
-        die(f"{a.task}'s thread was continued by {owner}; follow up on that task instead")
-    if busy:
-        die(f"{a.task} is running right now; wait until it finishes")
-    hint = f'to keep its warm context, set `continues = "{run.id}/{a.task}"` on a task in the new plan'
-    if rec.get("merged"):
-        die(f"{a.task} is already merged; start a new plan for further changes ({hint})")
-    if rec.get("status") == "stale":
-        die(f"{a.task} has stale dependencies; start a new plan on the updated code ({hint})")
-    if not thread:
-        die("task has no Codex thread to resume")
-    if t["writes"] and web:
-        die(f"{a.task}'s thread has seen web search results, so it can't resume with write access; re-plan the work")
-    if t["writes"] and not Path(rec.get("worktree", "")).is_dir():
-        die(f"worktree for {a.task} no longer exists (cleaned?)")
-    msg = a.message + "\n\nReply with the same JSON schema describing the final state (all changes so far)."
-    cwd = Path(rec["worktree"]) if t["writes"] else (Path(run.state["tasks"][t["base_writer"]]["worktree"])
-                                                     if t.get("base_writer") else repo or Path.cwd())
-    if not cwd.is_dir():
-        die("the dependency worktree no longer exists; start a new plan")
-    rec.update(status="running", pid=os.getpid(), error=None, result=None, checks=[], verdicts=[])
-    run.invalidate_dependents(a.task)
-    run.save()  # revoke the previous gates before the worker can change anything
-    call = run.codex(t, f"steer{len(rec['calls'])}", msg, "worker-result", cwd, t["sandbox"], resume=thread)
-    rec["calls"].append(call)
-    if not call_succeeded(call):
-        rec["status"], rec["error"] = ("skipped" if call.get("skipped") else "error"), call["error"]
-        if t["writes"]:
-            run.commit(t, cwd, f"orc({t['id']}): partial steer")
-    elif t["writes"]:
-        rec["result"], rec["error"] = call["final"], None
-        if call["final"]["status"] == "blocked":
-            run.commit(t, cwd, f"orc({t['id']}): blocked")
-            rec["status"] = "blocked"
-        else:
-            run.evaluate(t, rec, cwd, rec["base"], f"steer{len(rec['calls'])}", verify=not a.no_verify)
-        rec["diffstat"] = git("diff", "--shortstat", rec["base"], "HEAD", cwd=cwd, check=False)
-    else:
-        rec["result"], rec["status"], rec["error"] = call["final"], call["final"]["status"], None
-    rec["finished"] = now_iso()
-    run.save()
-    print("\n".join(task_line(rec, run_id=run.id)))
-    skipped = [tid for tid, r in run.state["tasks"].items() if r.get("status") == "skipped"]
-    if rec["status"] in OK_STATUSES and skipped:
-        print(f"Skipped tasks can now run: `orc resume {run.id}` ({', '.join(skipped)})")
-    return 0 if rec["status"] in OK_STATUSES else 2
+    run_dir = find_run(repo, a.run)
+    try:
+        with file_lock(run_dir / "command.lock", wait=False):
+            run = load_run(repo, run_dir.name)
+            with file_lock(orc_dir(repo) / "locks" / "ownership.lock"):
+                t = next((x for x in run.plan["task"] if x["id"] == a.task), None)
+                rec = run.state.get("tasks", {}).get(a.task)  # the Run's own state: this is what save() writes
+                if not t or not rec:
+                    die(f"unknown task {a.task} in run {run.id}")
+                thread = task_thread(rec)
+                web, owner, busy = thread_history(repo, thread) if thread else (False, None, False)
+                if owner and owner != f"{run.id}/{a.task}":
+                    die(f"{a.task}'s thread was continued by {owner}; follow up on that task instead")
+                if busy:
+                    die(f"{a.task} is running right now; wait until it finishes")
+                hint = f'to keep its warm context, set `continues = "{run.id}/{a.task}"` on a task in the new plan'
+                if rec.get("merged"):
+                    die(f"{a.task} is already merged; start a new plan for further changes ({hint})")
+                if rec.get("status") == "stale":
+                    die(f"{a.task} has stale dependencies; start a new plan on the updated code ({hint})")
+                if not thread:
+                    die("task has no Codex thread to resume")
+                if t["writes"] and web:
+                    die(f"{a.task}'s thread has seen web search results, so it can't resume with write access; re-plan the work")
+                if t["writes"] and not Path(rec.get("worktree", "")).is_dir():
+                    die(f"worktree for {a.task} no longer exists (cleaned?)")
+                msg = a.message + "\n\nReply with the same JSON schema describing the final state (all changes so far)."
+                cwd = Path(rec["worktree"]) if t["writes"] else (Path(run.state["tasks"][t["base_writer"]]["worktree"])
+                                                                 if t.get("base_writer") else repo or Path.cwd())
+                if not cwd.is_dir():
+                    die("the dependency worktree no longer exists; start a new plan")
+                rec.update(status="running", pid=os.getpid(), error=None, result=None, checks=[], verdicts=[])
+                run.invalidate_dependents(a.task)
+                run.save()  # revoke the previous gates before the worker can change anything
+            call = run.codex(t, f"steer{len(rec['calls'])}", msg, "worker-result", cwd, t["sandbox"], resume=thread)
+            rec["calls"].append(call)
+            if not call_succeeded(call):
+                rec["status"], rec["error"] = ("skipped" if call.get("skipped") else "error"), call["error"]
+                if t["writes"]:
+                    run.commit(t, cwd, f"orc({t['id']}): partial steer")
+            elif t["writes"]:
+                rec["result"], rec["error"] = call["final"], None
+                if call["final"]["status"] == "blocked":
+                    run.commit(t, cwd, f"orc({t['id']}): blocked")
+                    rec["status"] = "blocked"
+                else:
+                    run.evaluate(t, rec, cwd, rec["base"], f"steer{len(rec['calls'])}", verify=not a.no_verify)
+                rec["diffstat"] = git("diff", "--shortstat", rec["base"], "HEAD", cwd=cwd, check=False)
+            else:
+                rec["result"], rec["status"], rec["error"] = call["final"], call["final"]["status"], None
+            rec["finished"] = now_iso()
+            run.save()
+            print("\n".join(task_line(rec, run_id=run.id)))
+            skipped = [tid for tid, r in run.state["tasks"].items() if r.get("status") == "skipped"]
+            if rec["status"] in OK_STATUSES and skipped:
+                print(f"Skipped tasks can now run: `orc resume {run.id}` ({', '.join(skipped)})")
+            return 0 if rec["status"] in OK_STATUSES else 2
+    except LockBusy as e:
+        die(str(e))
 
 
 def cmd_resume(a) -> int:
     """Run the tasks of an existing run that were skipped (e.g. after steering a failed dependency to success)."""
     repo = repo_root()
-    run = load_run(repo, a.run)
-    todo = {t["id"] for t in run.plan["task"]
-            if run.state.get("tasks", {}).get(t["id"], {}).get("status") in (None, "skipped")}
-    if not todo:
-        print(f"nothing to resume in run {run.id}")
-        return 0
-    print(f"orc run {run.id} resumed ({len(todo)} tasks).", flush=True)
-    run.execute(todo)
-    run.state["finished"] = now_iso()
-    run.save()
-    summary = run_summary(run.dir, run.state)
-    (run.dir / "summary.md").write_text(summary + "\n")
-    print(summary)
-    return 0 if all(r.get("status") in OK_STATUSES for r in run.state["tasks"].values()) else 2
+    run_dir = find_run(repo, a.run)
+    try:
+        with file_lock(run_dir / "command.lock", wait=False):
+            run = load_run(repo, run_dir.name)
+            todo = {t["id"] for t in run.plan["task"]
+                    if run.state.get("tasks", {}).get(t["id"], {}).get("status") in (None, "skipped")}
+            if not todo:
+                print(f"nothing to resume in run {run.id}")
+                return 0
+            print(f"orc run {run.id} resumed ({len(todo)} tasks).", flush=True)
+            run.execute(todo)
+            run.state["finished"] = now_iso()
+            run.save()
+            summary = run_summary(run.dir, run.state)
+            (run.dir / "summary.md").write_text(summary + "\n")
+            print(summary)
+            return 0 if all(r.get("status") in OK_STATUSES for r in run.state["tasks"].values()) else 2
+    except LockBusy as e:
+        die(str(e))
 
 
 def cmd_merge(a) -> int:
@@ -1488,7 +1703,7 @@ def cmd_ask(a) -> int:
     if a.cont:  # follow-up: resume the earlier ask's (or task's) Codex thread, which remembers the conversation
         ref = a.cont
         if ref == "last":
-            ref = (find_ask(read_jsonl(d / "asks.jsonl"), "last", sid)
+            ref = (find_ask(history_asks(d / "asks.jsonl"), "last", sid)
                    or die("no earlier ask in this Claude session; give an ask id (see `orc show`)"))["id"]
         src = thread_source(repo, ref)
         if isinstance(src, str):
@@ -1519,14 +1734,18 @@ def cmd_ask(a) -> int:
                   f"you cannot modify files. The current directory is {where}. Answer in plain prose, not JSON, in at most about "
                   f"200 words unless the question needs more, and cite file:line.\n\n{question.strip()}\n")
     codex_start = read_json(ORC_HOME / "codex-limits.json") or codex_limits()
-    rec = codex_exec(model=model, effort=effort, sandbox="read-only", cwd=cwd, prompt=prompt, logdir=d, name=ask_id,
-                     web=web, resume=(src or {}).get("thread"), timeout_min=a.timeout or (30 if research else 10))
-    entry = {"id": ask_id, "at": now_iso(), "question": clip(question, 300), "research": research, "web": web,
-             "claude_session": sid, "codex_start": codex_start,
-             **({"parent": src["ref"], "root": src["root"]} if src else {}),
-             **{k: rec.get(k) for k in ("model", "effort", "usage", "cost", "seconds", "thread", "error")}}
-    with open(d / "asks.jsonl", "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    try:
+        with thread_turn(repo, (src or {}).get("thread"), (src or {}).get("root") if src and src["kind"] == "task" else None):
+            rec = codex_exec(model=model, effort=effort, sandbox="read-only", cwd=cwd, prompt=prompt, logdir=d, name=ask_id,
+                             web=web, resume=(src or {}).get("thread"), timeout_min=a.timeout or (30 if research else 10))
+            entry = {"id": ask_id, "at": now_iso(), "question": clip(question, 300), "research": research, "web": web,
+                     "claude_session": sid, "codex_start": codex_start,
+                     **({"parent": src["ref"], "root": src["root"]} if src else {}),
+                     **{k: rec.get(k) for k in ("model", "effort", "usage", "cost", "seconds", "thread", "error")}}
+            with open(d / "asks.jsonl", "a") as f:
+                f.write(json.dumps(entry) + "\n")
+    except RuntimeError as e:
+        die(str(e))
     footer = (f"— {short_model(model)} · {effort}{' · web' if web else ''} · "
               f"{fmt_tok(rec['usage']['input_tokens'] + rec['usage']['output_tokens'])} tok · ≈${rec.get('cost') or 0:.2f} · "
               f"{fmt_secs(rec.get('seconds'))} · ask {ask_id}" + (f" (follow-up to {src['ref']})" if src else ""))
@@ -1563,12 +1782,12 @@ def show_history(repo: Path | None, needle: str, n: int) -> str:
 
     runs = []
     for p, st in reversed(run_states(repo)):
-        tasks = st.get("tasks") if isinstance(st.get("tasks"), dict) else {}
-        extra = [read(p / "plan.toml")] + [json.dumps(r.get("result") or {}) for r in tasks.values() if isinstance(r, dict)] if needle else []
+        tasks = {tid: r for tid, rec in state_tasks(st).items() if (r := display_task(rec, tid)) is not None}
+        extra = [read(p / "plan.toml")] + [json.dumps(r.get("result") or {}) for r in tasks.values()] if needle else []
         if hit(str(st.get("goal") or ""), *extra):
             runs.append((p.name, st, tasks))
     convs: dict[str, list[dict]] = {}  # conversation root (an ask id, or <run>/<task> for questions to a worker) -> asks
-    for x in read_jsonl(ad / "asks.jsonl"):
+    for x in history_asks(ad / "asks.jsonl"):
         convs.setdefault(x.get("root") or x.get("id"), []).append(x)
     shown = [c for c in sorted(convs.values(), key=lambda c: c[-1].get("at") or "", reverse=True)
              if any(hit(x.get("question"), *([read(ad / f"{x.get('id')}.prompt.md"), read(ad / f"{x.get('id')}.final.md")] if needle else []))
@@ -1579,7 +1798,7 @@ def show_history(repo: Path | None, needle: str, n: int) -> str:
         for rid, st, tasks in runs[:n]:
             out.append(f"{rid}  {local_time(st.get('started'))}  {clip(str(st.get('goal') or ''), 90)}")
             out.append("  " + clip(" · ".join(f"{tid} {tasks[tid].get('status')}{' (merged)' if tasks[tid].get('merged') else ''}"
-                                               for tid in st.get("order", []) if isinstance(tasks.get(tid), dict)), 200))
+                                               for tid in state_order(st) if isinstance(tasks.get(tid), dict)), 200))
         if len(runs) > n:
             out.append(f"… {len(runs) - n} older runs (use -n)")
     if shown:
@@ -1606,7 +1825,9 @@ def cmd_show(a) -> int:
     runs = orc_dir(repo) / "runs"
     if "/" not in ref and (runs / ref / "state.json").exists():
         st = read_json(runs / ref / "state.json")
-        if not isinstance(st, dict) or not isinstance(st.get("tasks"), dict) or not all(k in st for k in ("id", "goal", "order")):
+        if (not isinstance(st, dict) or not isinstance(st.get("tasks"), dict)
+                or not all(isinstance(st.get(k), str) for k in ("id", "goal"))
+                or not isinstance(st.get("order"), list) or any(not isinstance(t, str) for t in st["order"])):
             die(f"run {ref} has an unreadable state.json")
         print(run_summary(runs / ref, st) + f"\nTask details: `orc show {ref}/<task>`")
         return 0
@@ -1615,10 +1836,14 @@ def cmd_show(a) -> int:
         st = read_json(runs / run_id / "state.json")
         if not isinstance(st, dict):
             die(f"no run {run_id}" if not (runs / run_id).is_dir() else f"run {run_id} has an unreadable state.json")
-        r = (st.get("tasks") or {}).get(tid)
-        if not isinstance(r, dict) or "status" not in r:
+        if not isinstance(st.get("tasks"), dict):
+            die(f"run {run_id} has an unreadable state.json (tasks must be an object)")
+        raw = state_tasks(st).get(tid)
+        if tid not in st["tasks"]:
             die(f"no task {tid} in run {run_id}")
-        r.setdefault("id", tid)
+        r = display_task(raw, tid)
+        if r is None:
+            die(f"task {tid} in run {run_id} has an unreadable record in state.json")
         res = r.get("result") or {}
         out = task_line(r, max_findings=1000, run_id=run_id)
         out.insert(1, f"   brief: {clip(str((plan_task(runs / run_id, tid) or {}).get('brief', '')), 300)}")
@@ -1641,7 +1866,7 @@ def cmd_show(a) -> int:
         print("\n".join(out))
         return 0
     ad = asks_dir(repo)
-    asks = read_jsonl(ad / "asks.jsonl")
+    asks = history_asks(ad / "asks.jsonl")
     x = find_ask(asks, ref, (claude_snapshot(repo) or {}).get("session_id")) or die(f"no run, task or ask {ref!r}; see `orc show`")
     root = x.get("root") or x["id"]
     chain = [y for y in asks if (y.get("root") or y.get("id")) == root]

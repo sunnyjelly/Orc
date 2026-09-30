@@ -1,5 +1,6 @@
 """End-to-end tests for bin/orc against tests/fake_codex.py. Run: python3 -m unittest discover tests"""
 import json
+import copy
 import os
 import re
 import runpy
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -1118,6 +1120,230 @@ class OrcTest(unittest.TestCase):
         out = self.orc("show").stdout
         self.assertLess(out.index("goal 20260930-101010-10"), out.index("goal 20260930-101010-2"))
         self.assertIn("run 20260930-101010-10 ", self.orc("resume").stderr)                 # the latest run
+
+    def wait_file(self, path, process):
+        deadline = time.monotonic() + 5
+        while not path.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(path.exists(), f"process did not reach {path}; exit={process.poll()}")
+
+    def test_concurrent_continuations_publish_only_one_claim(self):
+        self.plan("a.toml", self.ONE)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, _ = self.state()
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        # Widen precisely the validation/persistence gap in separate orc processes.
+        driver = self.tmp / "claim.py"
+        driver.write_text(textwrap.dedent(f'''
+            import runpy, sys, time
+            from pathlib import Path
+            from types import SimpleNamespace
+            mod = runpy.run_path({ORC[1]!r}, run_name="claim_test")
+            original = mod["resolve_continues"]
+            def slow_resolve(*args):
+                result = original(*args)
+                time.sleep(0.25)
+                return result
+            mod["cmd_run"].__globals__["resolve_continues"] = slow_resolve
+            mod["Run"].execute = lambda *args: None
+            Path(sys.argv[1]).touch()
+            deadline = time.monotonic() + 5
+            while not Path(sys.argv[2]).exists():
+                if time.monotonic() > deadline:
+                    raise RuntimeError("test did not start claimants")
+                time.sleep(0.01)
+            sys.exit(mod["cmd_run"](SimpleNamespace(plan="b.toml", only=None)))
+        '''))
+        go = self.tmp / "go"
+        processes = [subprocess.Popen([sys.executable, str(driver), str(self.tmp / f"ready{i}"), str(go)],
+                        cwd=self.repo, env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                     for i in range(2)]
+        try:
+            for i, process in enumerate(processes):
+                self.wait_file(self.tmp / f"ready{i}", process)
+            go.touch()
+            outputs = [p.communicate(timeout=10) for p in processes]
+            self.assertEqual(sorted(p.returncode for p in processes), [0, 1], outputs)
+            self.assertIn("continued by", "".join(out + err for out, err in outputs))
+            states = [json.loads(p.read_text()) for p in (self.repo / ".orc" / "runs").glob("*/state.json")]
+            self.assertEqual(sum(bool(st.get("continues")) for st in states), 1)
+        finally:
+            for p in processes:
+                if p.poll() is None:
+                    p.kill()
+                p.communicate(timeout=5)
+
+    def test_resume_refuses_transferred_threads_for_writers_and_readers(self):
+        self.plan("a.toml", self.ONE)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        source, st = self.state()
+        for role in ("implementer", "explorer"):
+            with self.subTest(role=role):
+                follow = self.FOLLOW.replace('role = "implementer"', f'role = "{role}"')
+                self.plan("b.toml", follow.replace("{ref}", f"{source}/impl-a") +
+                          '\n[[task]]\nid="x"\nrole="explorer"\nwhy="w"\nbrief="other"\n')
+                self.assertEqual(self.orc("run", "b.toml", "--only", "x").returncode, 0)
+                run_b, _ = self.state()
+                # B is filtered out but owns the claim; C transfers it before B's recovery.
+                self.plan("c.toml", self.FOLLOW.replace("{ref}", f"{run_b}/more"))
+                self.assertEqual(self.orc("run", "c.toml").returncode, 0)
+                run_c, _ = self.state()
+                before = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text())["calls"]
+                p = self.orc("resume", run_b)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn(f"continued by {run_c}/more", p.stdout)
+                disk = json.loads((self.repo / ".orc" / "runs" / run_b / "state.json").read_text())
+                self.assertEqual(disk["tasks"]["more"]["calls"], [])
+                after = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text())["calls"]
+                self.assertEqual(before, after)
+                # Use a new independent thread for the next role.
+                self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+                source, _ = self.state()
+
+    def test_active_worker_question_reserves_thread_and_releases_on_failure(self):
+        self.plan("a.toml", self.ONE)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, _ = self.state()
+        ref = f"{run_a}/impl-a"
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", ref))
+        gate = self.tmp / "question"
+        env = dict(self.env, ORC_FAKE_GATE=str(gate))
+        process = subprocess.Popen(ORC + ["ask", "--continue", ref, "FAKE_HOLD why?"], cwd=self.repo,
+                                   env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.wait_file(gate.with_suffix(".ready"), process)
+            for args in (("ask", "--continue", ref, "q"), ("steer", run_a, "impl-a", "q"),
+                         ("check", "b.toml"), ("run", "b.toml")):
+                p = self.orc(*args)
+                self.assertEqual(p.returncode, 1, (args, p.stdout, p.stderr))
+                self.assertIn("is running right now", p.stdout + p.stderr)
+            # The next reserved question will fail to launch Codex.
+            self.env["ORC_CODEX_BIN"] = str(self.tmp / "missing-codex")
+        finally:
+            gate.with_suffix(".release").touch()
+            out, err = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, out + err)
+        self.assertEqual(self.orc("ask", "--continue", ref, "q").returncode, 1)
+        self.env["ORC_CODEX_BIN"] = str(ROOT / "tests" / "fake_codex.py")
+        self.assertEqual(self.orc("ask", "--continue", ref, "q").returncode, 0)
+        self.assertEqual(self.orc("run", "b.toml").returncode, 0)
+
+    def test_active_ask_conversation_reserves_thread(self):
+        self.assertEqual(self.orc("ask", "q").returncode, 0)
+        ref = self.asks()[-1]["id"]
+        gate = self.tmp / "conversation"
+        process = subprocess.Popen(ORC + ["ask", "--continue", ref, "FAKE_HOLD q"], cwd=self.repo,
+                                   env=dict(self.env, ORC_FAKE_GATE=str(gate)), text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.wait_file(gate.with_suffix(".ready"), process)
+            p = self.orc("ask", "--continue", ref, "q2")
+            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+            self.assertIn("is running right now", p.stderr)
+        finally:
+            gate.with_suffix(".release").touch()
+            out, err = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, out + err)
+        self.assertEqual(self.orc("ask", "--continue", ref, "q3").returncode, 0)
+
+    def test_resume_waits_for_question_on_a_skipped_claimant(self):
+        self.plan("a.toml", self.ONE)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, _ = self.state()
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a") +
+                  '\n[[task]]\nid="x"\nrole="explorer"\nwhy="w"\nbrief="other"\n')
+        self.assertEqual(self.orc("run", "b.toml", "--only", "x").returncode, 0)
+        run_b, _ = self.state()
+        gate = self.tmp / "recovery"
+        process = subprocess.Popen(ORC + ["ask", "--continue", f"{run_b}/more", "FAKE_HOLD q"],
+                                   cwd=self.repo, env=dict(self.env, ORC_FAKE_GATE=str(gate)), text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.wait_file(gate.with_suffix(".ready"), process)
+            p = self.orc("resume", run_b)
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            self.assertIn("is running right now", p.stdout)
+            _, st = self.state()
+            self.assertEqual(st["tasks"]["more"]["status"], "skipped")
+            self.assertEqual(st["tasks"]["more"]["calls"], [])
+        finally:
+            gate.with_suffix(".release").touch()
+            out, err = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, out + err)
+        p = self.orc("resume", run_b)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_search_disabled_overrides_inherited_config_on_resumed_threads(self):
+        config = Path(self.env["CODEX_HOME"]) / "config.toml"
+        for mode in ("cached", "live"):
+            with self.subTest(mode=mode):
+                config.write_text(f'web_search = "{mode}"\n')
+                self.plan("a.toml", self.ONE)
+                self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+                run_a, _ = self.state()
+                p = self.orc("ask", "--continue", f"{run_a}/impl-a", "q")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn("web=False", p.stdout)
+                self.assertEqual(self.orc("ask", "--continue", "last", "q2").returncode, 0)
+                state = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text())
+                for call in state["invocations"][-3:]:
+                    self.assertEqual(call["web_search"], "disabled", call)
+                self.assertIsNotNone(state["invocations"][-1]["resume"])
+        self.assertIn("web=True", self.orc("ask", "--web", "q").stdout)
+
+    def test_reader_followup_preserves_dependency_checkout_and_old_state(self):
+        self.plan("a.toml", self.ONE + '\n[[task]]\nid="review"\nrole="reviewer"\nafter=["impl-a"]\nwhy="w"\nbrief="review"\n')
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, st = self.state()
+        cwd = st["tasks"]["impl-a"]["worktree"]
+        self.assertEqual(st["tasks"]["review"]["cwd"], cwd)
+        for legacy in (False, True):
+            if legacy:
+                del st["tasks"]["review"]["cwd"]
+                (self.repo / ".orc" / "runs" / run_a / "state.json").write_text(json.dumps(st))
+            p = self.orc("ask", "--continue", f"{run_a}/review", "q")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("[cwd=impl-a sandbox=read-only", p.stdout)
+        self.assertEqual(self.orc("clean", run_a).returncode, 0)
+        self.assertIn("[cwd=repo sandbox=read-only", self.orc("ask", "--continue", f"{run_a}/review", "q").stdout)
+
+    def test_show_rejects_malformed_selected_records_and_skips_unrelated_records(self):
+        self.plan("a.toml", self.ONE)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, original = self.state()
+        path = self.repo / ".orc" / "runs" / run_a / "state.json"
+        mutations = [("tasks", ["junk"]), ("calls", ["junk"]), ("calls", [{"usage": [1]}]),
+                     ("calls", [{"name": None}]), ("calls", [{"cost": "junk"}]), ("result", [1]),
+                     ("result", {"findings": "junk"}), ("checks", [{"exit": 1, "tail": [1]}]),
+                     ("verdicts", [{"issues": ["junk"]}])]
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                st = copy.deepcopy(original)
+                if key == "tasks":
+                    st[key] = value
+                else:
+                    st["tasks"]["impl-a"][key] = value
+                path.write_text(json.dumps(st))
+                p = self.orc("show", f"{run_a}/impl-a")
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn("unreadable", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                for args in (("show",), ("show", run_a)):
+                    p = self.orc(*args)
+                    self.assertIn(p.returncode, (0, 1))
+                    self.assertNotIn("Traceback", p.stderr)
+        original["tasks"]["bad"] = {"id": "bad", "status": "done", "calls": [1]}
+        original["order"].append("bad")
+        path.write_text(json.dumps(original))
+        for args in (("show",), ("show", run_a), ("show", f"{run_a}/impl-a")):
+            p = self.orc(*args)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("impl-a", p.stdout)
+        asks = self.repo / ".orc" / "asks"
+        asks.mkdir(exist_ok=True)
+        with open(asks / "asks.jsonl", "a") as f:
+            f.write(json.dumps({"id": "bad", "root": [], "question": [1]}) + "\n")
+        self.assertEqual(self.orc("show").returncode, 0)
 
 
 class PackagingTest(unittest.TestCase):
