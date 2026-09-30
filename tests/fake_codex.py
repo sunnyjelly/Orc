@@ -9,6 +9,7 @@ first prompt of a thread (remembered per thread, so resumes keep the mode):
   FAKE_BREAK_CHECK        -> the implementer's first attempt fails the checks
   FAKE_BREAK_UNTIL_STEER  -> every attempt fails the checks until a prompt contains STEER_FIX
   FAKE_BLOCKED            -> the worker reports status "blocked"
+  (FAKE_BREAK_UNTIL_STEER and FAKE_BLOCKED also switch on when a resumed thread's prompt contains them)
 Workers report the directory they ran in ("fake worker in <dir name>").
 """
 import fcntl
@@ -71,9 +72,11 @@ if schema.endswith("verdict.schema.json"):
              "issues": [] if verdict == "pass" else [{"severity": "major", "location": "fake.txt:1", "problem": "fake problem"}]}
 else:
     threads = st.setdefault("threads", {})
+    markers = ("FAKE_BREAK_CHECK", "FAKE_BREAK_UNTIL_STEER", "FAKE_BLOCKED")
     if not resume:
-        threads[thread] = {m: m in prompt for m in ("FAKE_BREAK_CHECK", "FAKE_BREAK_UNTIL_STEER", "FAKE_BLOCKED")}
-    mode = threads.get(thread, {})
+        threads[thread] = {m: m in prompt for m in markers}
+    mode = threads.setdefault(thread, {})
+    mode.update({m: True for m in markers[1:] if m in prompt})  # a continued thread can take on a new mode
     if "STEER_FIX" in prompt:
         mode["FAKE_BREAK_UNTIL_STEER"] = False
     changes = []

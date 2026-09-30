@@ -24,7 +24,7 @@ id = "map-auth"            # lowercase-kebab, unique
 role = "explorer"          # explorer | reviewer (read-only) | implementer (writes, in its own worktree)
 model = "luna"             # optional: sol (default, gpt-6.1-sol) | luna (gpt-6-luna, cheap: simple scouting only) | full id
 web = true                 # optional, explorer/reviewer only: live web search
-continues = "20260930-101010/map-auth"   # optional: resume that earlier task's (or an ask id's) Codex thread; see below
+continues = "20260930-101010/map-auth"   # optional: resume that earlier task's Codex thread; see below
 why = "Shown to the user and to other workers: why this task exists and why it is delegated"
 brief = """What to find or do. See briefs.md."""
 
@@ -68,7 +68,10 @@ How a task runs:
   - `error`: Codex failed (missing, timed out, no valid output)
   - `stale`: an upstream task was steered after this task ran; merge the updated upstream task and write a new plan for this work. Its old branch is preserved; even an explicit merge cannot bypass stale dependencies.
   - `skipped`: a dependency didn't succeed, or the Codex quota guard stopped it; `orc resume <run>` runs skipped tasks later
-- `continues`: the task's first call resumes the named Codex thread (`<run>/<task>` from any earlier run, or an ask id) instead of starting cold. The worker keeps its memory of the earlier work. It still gets the full brief, runs in a fresh worktree (or the usual read-only directory), and goes through the normal checks, verification and repairs. The prompt tells it whether its earlier changes are already in the checkout (merged) or not (then it must redo what it still needs). Use it for follow-up work on merged tasks, redoing stale work, or implementing what an explorer or `orc ask` worked out. One thread can be continued by only one task per plan, and an implementer can't continue a thread that used web search. Keep the same model, so the prompt cache carries over.
+- `continues`: the task's first call resumes the Codex thread of `<run>/<task>` from any earlier run, instead of starting cold. The worker keeps its memory of the earlier work. It still gets the full brief, runs in a fresh worktree (or the usual read-only directory), and goes through the normal checks, verification and repairs. The prompt tells it whether its earlier changes are already in the checkout (merged) or not (then it must redo what it still needs). Use it for follow-up work on merged tasks, redoing stale work, or implementing what an explorer worked out. Rules:
+  - The thread then belongs to the new task. Steer, question or continue that task from now on; orc refuses the old one.
+  - One thread per plan.
+  - An implementer can't continue a thread that ever used web search. Keep the same model, so the prompt cache carries over.
 - A read-only task that comes after an implementer (directly or through other read-only tasks) runs in that implementer's worktree, so it sees the new code. An implementer that comes after one branches from its branch.
 - A failed worker, repair, or steer cannot pass on the strength of final JSON alone. Partial implementation work is committed for recovery. A verifier execution error produces `uncertain`, even if its final JSON says `pass`.
 - `resume` reuses a quota-skipped implementer's existing worktree and call history. Partial merges retain branches and worktrees while unfinished tasks still need them. Merge refuses to run during another Git operation and leaves dirty worktrees available for inspection.
