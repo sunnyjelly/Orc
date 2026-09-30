@@ -89,7 +89,7 @@ Open any git repo in Claude Code and ask for work as usual. Set the model to Opu
 | `orc check PLAN` | Validates the plan (roles, acceptance criteria, file ownership, cycles) and prints the plan table, estimated Codex calls and current limits. No Codex calls. |
 | `orc run PLAN [--only a,b]` | Runs the plan. Prints progress to stderr and a compact summary to stdout. Exit 0 if everything passed, 2 otherwise. |
 | `orc steer RUN TASK "msg"` | Follow-up on a task's own Codex thread (warm context), then re-check and re-verify. |
-| `orc merge [RUN] [TASK…]` | Merges verified branches (`--no-ff`) and removes their worktrees. Stops and exits 1 at the first conflict. |
+| `orc merge [RUN] [TASK…]` | Merges verified branches (`--no-ff`) and removes clean worktrees once dependents no longer need them. Refuses stale dependencies or an existing Git operation; exits 1 at the first conflict. |
 | `orc clean [RUN]` | Removes a run's leftover worktrees and branches. |
 | `orc report [RUN…] [--all]` | Tokens, ≈ API cost and limit % for this Claude session's runs plus the session itself. |
 | `orc resume [RUN]` | Runs a run's skipped tasks, e.g. after `steer` fixed the task they depend on. |
@@ -133,6 +133,9 @@ The tests run against `tests/fake_codex.py`. They cover:
 - steer and resume
 - implement → review → fix chains
 - blocked workers and merge conflicts
+- failed workers, repairs, steers and verifiers, with partial-work preservation
+- stale descendants, changed parent branches, existing Git operations, and partial merges with pending dependents
+- malformed settings, numeric plan validation, and quota recovery and queueing
 - the quota guard
 - report scoping and setup
 - the packaged skills They have not yet run against real Codex; see the "Assumptions to verify" section in `docs/design.md`.

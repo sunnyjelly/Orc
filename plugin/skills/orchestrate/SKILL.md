@@ -68,6 +68,7 @@ The run summary normally has everything you need. Open files under `.orc/runs/` 
 - Explorer findings are claims: spot-check the one or two that your decisions rest on.
 - `orc merge <run> && <project test command>` in one call (merge exits non-zero on a conflict), then fix anything the combined result breaks.
 - `blocked` means the worker stopped to ask something: answer its open question with `orc steer`, or re-plan.
+- **stale**: an upstream task was steered after this task ran. Merge the updated upstream task, then write a new plan for the stale work; its old branch is preserved.
 
 ## 5. Report (always, also for Solo work)
 
