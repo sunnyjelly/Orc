@@ -1,6 +1,7 @@
 """End-to-end tests for bin/orc against tests/fake_codex.py. Run: python3 -m unittest discover tests"""
 import json
 import copy
+import io
 import os
 import re
 import runpy
@@ -16,6 +17,15 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 ORC = [sys.executable, str(ROOT / "plugin" / "skills" / "orchestrate" / "scripts" / "orc")]
+
+
+def codex_bin(script: Path) -> str:
+    """ORC_CODEX_BIN for a Python stand-in. Windows can't exec a .py, so wrap it in a .cmd, like npm's codex.cmd."""
+    if os.name != "nt":
+        return str(script)
+    cmd = Path(tempfile.gettempdir()) / f"{script.stem}.{os.getpid()}.cmd"
+    cmd.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+    return str(cmd)
 
 PLAN = textwrap.dedent('''
     goal = "Demo: add two files and a follow-up"
@@ -65,27 +75,27 @@ class OrcTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
-        self.env = dict(os.environ, ORC_CODEX_BIN=str(ROOT / "tests" / "fake_codex.py"),
+        self.env = dict(os.environ, ORC_CODEX_BIN=codex_bin(ROOT / "tests" / "fake_codex.py"),
                         CODEX_HOME=str(self.tmp / "codex"), ORC_HOME=str(self.tmp / "orc"))
         (self.tmp / "codex").mkdir()
         for cmd in (["git", "init", "-q", "-b", "main"], ["git", "config", "user.email", "t@t"], ["git", "config", "user.name", "t"]):
             subprocess.run(cmd, cwd=self.repo, check=True)
-        (self.repo / "README").write_text("hi\n")
+        (self.repo / "README").write_text("hi\n", encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-qm", "init"], cwd=self.repo, check=True)
-        (self.repo / "plan.toml").write_text(PLAN)
+        (self.repo / "plan.toml").write_text(PLAN, encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-qm", "plan"], cwd=self.repo, check=True)
 
     def orc(self, *args, stdin=None):
-        return subprocess.run(ORC + list(args), cwd=self.repo, env=self.env, text=True, capture_output=True, input=stdin)
+        return subprocess.run(ORC + list(args), cwd=self.repo, env=self.env, text=True, encoding="utf-8", errors="replace", capture_output=True, input=stdin)
 
     def test_check_renders_and_rejects_overlap(self):
         p = self.orc("check", "plan.toml")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("| 2 | impl-a | implementer · sol high", p.stdout)
         bad = PLAN.replace('files = ["impl-b.txt"]', 'files = ["impl-*.txt"]')
-        (self.repo / "bad.toml").write_text(bad)
+        (self.repo / "bad.toml").write_text(bad, encoding="utf-8")
         p = self.orc("check", "bad.toml")
         self.assertEqual(p.returncode, 1)
         self.assertIn("overlapping files", p.stdout)
@@ -116,7 +126,7 @@ class OrcTest(unittest.TestCase):
         self.assertIn("✓ impl-c [implementer·high] checks-passed", out)
         self.assertIn("orc merge", out)
         run_dir = next((self.repo / ".orc" / "runs").iterdir())
-        state = json.loads((run_dir / "state.json").read_text())
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         a = state["tasks"]["impl-a"]
         self.assertEqual([c["name"] for c in a["calls"]], ["worker", "repair1", "verifier2"])
         self.assertEqual([c["name"] for c in state["tasks"]["impl-b"]["calls"]], ["worker", "verifier1", "repair1", "verifier3"])
@@ -126,10 +136,10 @@ class OrcTest(unittest.TestCase):
         self.assertNotEqual(b[0]["thread"], b[1]["thread"])
         # impl-c branched from impl-a, so it sees impl-a.txt
         self.assertTrue((Path(state["tasks"]["impl-c"]["worktree"]) / "impl-a.txt").exists())
-        prompt = (run_dir / "impl-c" / "worker.prompt.md").read_text()
+        prompt = (run_dir / "impl-c" / "worker.prompt.md").read_text(encoding="utf-8")
         self.assertIn("## Input from `impl-a`", prompt)
         self.assertIn("Keep it small.", prompt)
-        vprompt = (run_dir / "impl-b" / "verifier1.prompt.md").read_text()
+        vprompt = (run_dir / "impl-b" / "verifier1.prompt.md").read_text(encoding="utf-8")
         self.assertIn("check them, do not trust them", vprompt)
         self.assertNotIn("fake worker in", vprompt)  # the implementer's own summary is withheld from the verifier
 
@@ -159,32 +169,94 @@ class OrcTest(unittest.TestCase):
         self.assertIn("- fake research finding (model=gpt-6.1-sol effort=high web=True)", p.stdout)
         self.assertNotIn("long details", p.stdout)  # only the summary reaches the lead
         report_path = p.stdout.split("Full report: ")[1].splitlines()[0]
-        self.assertIn("long details", Path(report_path).read_text())
+        self.assertIn("long details", Path(report_path).read_text(encoding="utf-8"))
         rep = self.orc("report").stdout
         self.assertIn("| ask ×1 | sol · high | 1 ok | 1 |", rep)
         self.assertIn("| ask ×1 | luna · xhigh | 1 ok | 1 |", rep)
         self.assertIn("| research ×1 | sol · high | 1 ok | 1 |", rep)
         self.assertIn("gpt-6-luna, gpt-6.1-sol, ChatGPT plan):** 3 calls", rep)
 
+    @unittest.skipUnless(os.name == "nt", "Windows batch launcher boundary")
+    def test_batch_launcher_preserves_shell_characters_in_worker_argv(self):
+        renamed = self.repo.with_name("repo&ver&rem%OS%!")
+        renamed.resolve().relative_to(self.tmp.resolve())
+        self.repo.rename(renamed)
+        self.repo = renamed
+        model = "luna&ver&rem%OS%!"
+        p = self.orc("ask", "--model", model, "unicode question: Καλημέρα")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(f"model={model} effort=high web=False", p.stdout)
+        calls = json.loads((self.tmp / "codex" / "fake-state.json").read_text(encoding="utf-8"))["invocations"]
+        self.assertEqual(calls[-1]["cwd"], str(self.repo))
+        self.assertEqual(calls[-1]["sandbox"], "read-only")
+
+    @unittest.skipUnless(os.name == "nt", "Windows batch launcher boundary")
+    def test_batch_launcher_roundtrips_quotes_and_escaped_paths(self):
+        mod = runpy.run_path(ORC[1], run_name="argv_test")
+        directory = self.tmp / "launcher & space %OS%!"
+        directory.mkdir()
+        script = directory / "echo.py"
+        script.write_text("import json, sys; print(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+        shim = directory / "echo.cmd"
+        shim.write_text(f'@"{sys.executable}" "%~dp0echo.py" %*\n', encoding="utf-8")
+        args = ["", 'model_reasoning_effort="high"', "a&ver&rem", "spaces and \"quotes\"", "end\\",
+                "%OS%", "!OS!", "^caret", "(parentheses)", "<in>|out", "Καλημέρα"]
+        p = mod["run_argv"]([str(shim), *args], text=True, encoding="utf-8", capture_output=True)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(json.loads(p.stdout), args)
+        for bad in ("line\nbreak", "line\rbreak", "nul\0byte"):
+            with self.assertRaises(ValueError):
+                mod["run_argv"]([str(shim), bad])
+
+    def test_main_accepts_redirected_text_streams(self):
+        mod = runpy.run_path(ORC[1], run_name="main_test")
+        with patch.object(sys, "stdout", io.StringIO()) as out, patch.object(sys, "stderr", io.StringIO()), \
+                patch.object(sys, "stdin", io.StringIO("{}")), patch.dict(os.environ, self.env):
+            mod["main"].__globals__["ORC_HOME"] = self.tmp / "orc"
+            self.assertEqual(mod["main"](["statusline"]), 0)
+            self.assertIn("Claude", out.getvalue())
+
+    def test_invalid_utf8_records_and_plans_fail_safely(self):
+        (self.repo / "bad.toml").write_bytes(b'goal = "\xff"\n')
+        p = self.orc("check", "bad.toml")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("cannot read plan", p.stdout)
+        self.assertNotIn("Traceback", p.stderr)
+        mod = runpy.run_path(ORC[1], run_name="utf8_test")
+        self.assertEqual(mod["plan_task"](self.repo, "a"), {})
+        (self.repo / "plan.toml").write_bytes(b'goal = "\xff"\n')
+        self.assertIsNone(mod["plan_task"](self.repo, "a"))
+        asks = self.repo / ".orc" / "asks"
+        asks.mkdir(parents=True)
+        (asks / "asks.jsonl").write_bytes(b'\xff\n{"id":"readable", "question":"still here"}\n')
+        p = self.orc("show")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("still here", p.stdout)
+        exclude = self.repo / ".git" / "info" / "exclude"
+        exclude.write_bytes(b'# legacy comment: \xff\n')
+        mod["runs_dir"](self.repo)
+        self.assertTrue(exclude.read_bytes().startswith(b'# legacy comment: \xff\n'))
+        self.assertIn(b".orc/", exclude.read_bytes())
+
     def test_plan_model_alias_and_web(self):
         plan = PLAN.replace('brief = "Look around."', 'brief = "Look around."\nmodel = "luna"\nweb = true')
-        (self.repo / "p2.toml").write_text(plan)
+        (self.repo / "p2.toml").write_text(plan, encoding="utf-8")
         p = self.orc("check", "p2.toml")
         self.assertEqual(p.returncode, 0, p.stdout)
         self.assertIn("| 1 | scout | explorer · luna medium · web |", p.stdout)
         bad = PLAN.replace('files = ["impl-c.txt"]', 'files = ["impl-c.txt"]\nweb = true')
-        (self.repo / "p3.toml").write_text(bad)
+        (self.repo / "p3.toml").write_text(bad, encoding="utf-8")
         self.assertIn("`web` is for explorer/reviewer tasks", self.orc("check", "p3.toml").stdout)
 
     # ---- regression tests for the independent audit ------------------------------------------
 
     def plan(self, name, body):
-        (self.repo / name).write_text(textwrap.dedent(body))
+        (self.repo / name).write_text(textwrap.dedent(body), encoding="utf-8")
         return name
 
     def state(self):
         run_dir = sorted((self.repo / ".orc" / "runs").iterdir())[-1]
-        return run_dir.name, json.loads((run_dir / "state.json").read_text())
+        return run_dir.name, json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
 
     def test_steer_is_saved_then_resume_and_merge(self):
         self.plan("s.toml", """
@@ -223,7 +295,7 @@ class OrcTest(unittest.TestCase):
         p = self.orc("merge", run_id)
         self.assertEqual(p.returncode, 0, p.stdout)
         self.assertIn("merged: base, child", p.stdout)
-        self.assertIn("ok", (self.repo / "base.txt").read_text())
+        self.assertIn("ok", (self.repo / "base.txt").read_text(encoding="utf-8"))
 
     def test_reviewer_after_implementer_sees_its_code(self):
         self.plan("r.toml", """
@@ -299,7 +371,7 @@ class OrcTest(unittest.TestCase):
             verify = "checks"
         """)
         self.assertEqual(self.orc("run", "c.toml").returncode, 0)
-        (self.repo / "impl-a.txt").write_text("main's version\n")
+        (self.repo / "impl-a.txt").write_text("main's version\n", encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-qm", "conflicting"], cwd=self.repo, check=True)
         p = self.orc("merge")
@@ -316,6 +388,13 @@ class OrcTest(unittest.TestCase):
         p = self.orc("ask", "q")
         self.assertEqual(p.returncode, 1)
         self.assertIn("skipped: Codex 5h limit at 95%", p.stdout)
+
+    def test_limits_found_despite_old_top_level_rollouts(self):
+        self.assertEqual(self.orc("run", "plan.toml").returncode, 0)                    # fake writes dated rollouts
+        (self.tmp / "codex" / "sessions" / "rollout-2025-08-07-old.json").write_text("{}", encoding="utf-8")
+        p = self.orc("doctor")
+        self.assertIn("Codex limits:", p.stdout)
+        self.assertNotIn("limits n/a", p.stdout)
 
     def test_report_for_solo_session_ignores_older_runs(self):
         status = lambda sid: json.dumps({"session_id": sid, "workspace": {"project_dir": str(self.repo)}})
@@ -335,17 +414,17 @@ class OrcTest(unittest.TestCase):
         cfg = self.tmp / "claude-config"
         self.env["CLAUDE_CONFIG_DIR"] = str(cfg)
         cfg.mkdir()
-        (cfg / "settings.json").write_text(json.dumps({"model": "opus", "statusLine": {"type": "command", "command": "mine.sh"}}))
+        (cfg / "settings.json").write_text(json.dumps({"model": "opus", "statusLine": {"type": "command", "command": "mine.sh"}}), encoding="utf-8")
         p = self.orc("setup")
         self.assertIn("left unchanged", p.stdout)                           # never clobbers a user's status line
-        self.assertEqual(json.loads((cfg / "settings.json").read_text())["statusLine"]["command"], "mine.sh")
+        self.assertEqual(json.loads((cfg / "settings.json").read_text(encoding="utf-8"))["statusLine"]["command"], "mine.sh")
         self.orc("setup", "--force")
-        settings = json.loads((cfg / "settings.json").read_text())
+        settings = json.loads((cfg / "settings.json").read_text(encoding="utf-8"))
         self.assertEqual(settings["model"], "opus")                          # other settings kept
         app = Path(self.env["ORC_HOME"]) / "app" / "orc"
-        self.assertIn(str(app), settings["statusLine"]["command"])
+        self.assertIn(app.as_posix(), settings["statusLine"]["command"])
         p = subprocess.run([sys.executable, str(app), "statusline"], input=json.dumps({"model": {"display_name": "Opus"}}),
-                           text=True, capture_output=True, env=self.env)
+                           text=True, encoding="utf-8", errors="replace", capture_output=True, env=self.env)
         self.assertEqual(p.stdout.strip(), "Opus")
 
     def test_report_without_runs(self):
@@ -383,9 +462,9 @@ class OrcTest(unittest.TestCase):
 
     def fake_script(self, body):
         script = self.tmp / "wrapper.py"
-        script.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body))
+        script.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body), encoding="utf-8")
         script.chmod(0o755)
-        self.env["ORC_CODEX_BIN"] = str(script)
+        self.env["ORC_CODEX_BIN"] = codex_bin(script)
 
     def test_failed_steer_preserves_partial_work_and_revokes_success(self):
         self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
@@ -396,7 +475,7 @@ class OrcTest(unittest.TestCase):
             from pathlib import Path
             args = sys.argv
             cwd = Path(args[args.index("-C") + 1])
-            (cwd / "unfinished.txt").write_text("valuable partial work")
+            (cwd / "unfinished.txt").write_text("valuable partial work", encoding="utf-8")
             sys.exit(1)
         ''')
         p = self.orc("steer", rid, "base", "fix something")
@@ -404,37 +483,37 @@ class OrcTest(unittest.TestCase):
         _, st = self.state()
         r = st["tasks"]["base"]
         self.assertEqual(r["status"], "error")
-        saved = subprocess.check_output(["git", "show", f"{r['branch']}:unfinished.txt"], cwd=self.repo, text=True)
+        saved = subprocess.check_output(["git", "show", f"{r['branch']}:unfinished.txt"], cwd=self.repo, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(saved, "valuable partial work")
         self.assertEqual(self.orc("merge", rid).returncode, 0)
         self.assertTrue(wt.exists())
         self.assertFalse(self.state()[1]["tasks"]["base"].get("merged"))
-        self.env["ORC_CODEX_BIN"] = str(ROOT / "tests" / "fake_codex.py")
+        self.env["ORC_CODEX_BIN"] = codex_bin(ROOT / "tests" / "fake_codex.py")
         self.assertEqual(self.orc("steer", rid, "base", "finish the work").returncode, 0)
         self.assertEqual(self.orc("merge", rid).returncode, 0)
-        self.assertEqual((self.repo / "unfinished.txt").read_text(), "valuable partial work")
+        self.assertEqual((self.repo / "unfinished.txt").read_text(encoding="utf-8"), "valuable partial work")
 
     def test_merge_preserves_an_existing_merge_and_manual_resolution(self):
         self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
         rid, _ = self.state()
         def git(*args):
-            return subprocess.run(["git", *args], cwd=self.repo, text=True, capture_output=True)
+            return subprocess.run(["git", *args], cwd=self.repo, text=True, encoding="utf-8", errors="replace", capture_output=True)
         self.assertEqual(git("checkout", "-qb", "other").returncode, 0)
-        (self.repo / "README").write_text("other branch\n")
+        (self.repo / "README").write_text("other branch\n", encoding="utf-8")
         self.assertEqual(git("add", "README").returncode, 0)
         self.assertEqual(git("commit", "-qm", "other version").returncode, 0)
         self.assertEqual(git("checkout", "-q", "main").returncode, 0)
-        (self.repo / "README").write_text("main branch\n")
+        (self.repo / "README").write_text("main branch\n", encoding="utf-8")
         self.assertEqual(git("add", "README").returncode, 0)
         self.assertEqual(git("commit", "-qm", "main version").returncode, 0)
         self.assertEqual(git("merge", "other").returncode, 1)
         resolution = "valuable in-progress manual resolution\n"
-        (self.repo / "README").write_text(resolution)
-        merge_head = (self.repo / ".git" / "MERGE_HEAD").read_text()
+        (self.repo / "README").write_text(resolution, encoding="utf-8")
+        merge_head = (self.repo / ".git" / "MERGE_HEAD").read_text(encoding="utf-8")
         p = self.orc("merge", rid)
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-        self.assertEqual((self.repo / "README").read_text(), resolution)
-        self.assertEqual((self.repo / ".git" / "MERGE_HEAD").read_text(), merge_head)
+        self.assertEqual((self.repo / "README").read_text(encoding="utf-8"), resolution)
+        self.assertEqual((self.repo / ".git" / "MERGE_HEAD").read_text(encoding="utf-8"), merge_head)
 
     def test_steering_parent_invalidates_descendants_and_keeps_new_commits(self):
         self.assertEqual(self.orc("run", self.review_plan(child=True)).returncode, 0)
@@ -442,21 +521,21 @@ class OrcTest(unittest.TestCase):
         branch = st["tasks"]["base"]["branch"]
         wt = Path(st["tasks"]["base"]["worktree"])
         self.assertEqual(self.orc("steer", rid, "base", "change base").returncode, 0)
-        updated = (wt / "base.txt").read_text()
+        updated = (wt / "base.txt").read_text(encoding="utf-8")
         _, st = self.state()
         self.assertEqual(st["tasks"]["child"]["status"], "stale")
         p = self.orc("merge", rid, "child")
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertFalse(self.state()[1]["tasks"]["base"].get("merged"))
         self.assertTrue(wt.exists())
-        self.assertEqual(subprocess.check_output(["git", "show", f"{branch}:base.txt"], cwd=self.repo, text=True), updated)
+        self.assertEqual(subprocess.check_output(["git", "show", f"{branch}:base.txt"], cwd=self.repo, text=True, encoding="utf-8", errors="replace"), updated)
         self.assertEqual(self.orc("merge", rid).returncode, 0)
-        self.assertEqual((self.repo / "base.txt").read_text(), updated)
+        self.assertEqual((self.repo / "base.txt").read_text(encoding="utf-8"), updated)
         self.assertFalse((self.repo / "child.txt").exists())
 
     def test_steering_invalidates_transitive_readers_and_writers(self):
         plan = self.review_plan(child=True)
-        body = (self.repo / plan).read_text() + '''
+        body = (self.repo / plan).read_text(encoding="utf-8") + '''
             [[task]]
             id = "review"
             role = "reviewer"
@@ -464,7 +543,7 @@ class OrcTest(unittest.TestCase):
             why = "review child"
             brief = "review"
         '''
-        (self.repo / plan).write_text(body)
+        (self.repo / plan).write_text(body, encoding="utf-8")
         self.assertEqual(self.orc("run", plan).returncode, 0)
         rid, _ = self.state()
         self.assertEqual(self.orc("steer", rid, "base", "change base").returncode, 0)
@@ -477,7 +556,7 @@ class OrcTest(unittest.TestCase):
         self.assertEqual(self.orc("run", self.review_plan(child=True)).returncode, 0)
         rid, st = self.state()
         wt = Path(st["tasks"]["base"]["worktree"])
-        (wt / "new-parent.txt").write_text("new parent code")
+        (wt / "new-parent.txt").write_text("new parent code", encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
         subprocess.run(["git", "commit", "-qm", "parent changed outside orc"], cwd=wt, check=True)
         p = self.orc("merge", rid, "child")
@@ -491,13 +570,13 @@ class OrcTest(unittest.TestCase):
         self.env["CLAUDE_CONFIG_DIR"] = str(cfg)
         settings = cfg / "settings.json"
         malformed = '{"model":"opus","permissions":{"deny":["Bash(rm *)"]},'
-        settings.write_text(malformed)
+        settings.write_text(malformed, encoding="utf-8")
         for args in ((), ("--force",)):
             with self.subTest(args=args):
-                settings.write_text(malformed)
+                settings.write_text(malformed, encoding="utf-8")
                 p = self.orc("setup", *args)
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-                self.assertEqual(settings.read_text(), malformed)
+                self.assertEqual(settings.read_text(encoding="utf-8"), malformed)
 
     def error_after_final(self, predicate):
         self.fake_script(f'''
@@ -562,11 +641,11 @@ class OrcTest(unittest.TestCase):
         limits = Path(self.env["ORC_HOME"]) / "codex-limits.json"
         limits.parent.mkdir(parents=True)
         limits.write_text(json.dumps({"rate_limits": {"primary": {
-            "used_percent": 95, "window_minutes": 300, "resets_at": 4102444800}}}))
+            "used_percent": 95, "window_minutes": 300, "resets_at": 4102444800}}}), encoding="utf-8")
         self.assertEqual(self.orc("run", plan).returncode, 2)
         rid, st = self.state()
         self.assertEqual(st["tasks"]["base"]["status"], "skipped")
-        limits.write_text("{}")
+        limits.write_text("{}", encoding="utf-8")
         p = self.orc("resume", rid)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.state()[1]["tasks"]["base"]["status"], "checks-passed")
@@ -575,7 +654,7 @@ class OrcTest(unittest.TestCase):
 
     def test_partial_merge_keeps_resources_for_pending_child_and_reader(self):
         plan = self.review_plan(child=True)
-        body = (self.repo / plan).read_text() + '''
+        body = (self.repo / plan).read_text(encoding="utf-8") + '''
             [[task]]
             id = "review"
             role = "reviewer"
@@ -583,7 +662,7 @@ class OrcTest(unittest.TestCase):
             why = "read base"
             brief = "read base"
         '''
-        (self.repo / plan).write_text(body)
+        (self.repo / plan).write_text(body, encoding="utf-8")
         self.assertEqual(self.orc("run", plan, "--only", "base").returncode, 0)
         rid, st = self.state()
         wt = Path(st["tasks"]["base"]["worktree"])
@@ -612,7 +691,7 @@ class OrcTest(unittest.TestCase):
                              ('timeout_min = "bad"', 'timeout_min'), ('max_repairs = 1.5', 'max_repairs')]:
             with self.subTest(extra=extra):
                 plan = self.review_plan()
-                with open(self.repo / plan, "a") as f:
+                with open(self.repo / plan, "a", encoding="utf-8") as f:
                     f.write(extra + "\n")
                 p = self.orc("check", plan)
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
@@ -625,7 +704,7 @@ class OrcTest(unittest.TestCase):
         home = Path(self.env["ORC_HOME"])
         home.mkdir()
         limits = home / "codex-limits.json"
-        limits.write_text("{}")
+        limits.write_text("{}", encoding="utf-8")
         waiting, release = threading.Event(), threading.Event()
         class HeldSlot:
             def __enter__(self):
@@ -647,7 +726,7 @@ class OrcTest(unittest.TestCase):
         try:
             self.assertTrue(waiting.wait(5))
             limits.write_text(json.dumps({"rate_limits": {"primary": {
-                "used_percent": 95, "window_minutes": 300, "resets_at": 4102444800}}}))
+                "used_percent": 95, "window_minutes": 300, "resets_at": 4102444800}}}), encoding="utf-8")
         finally:
             release.set()
             worker.join(5)
@@ -675,7 +754,7 @@ class OrcTest(unittest.TestCase):
     # ---- follow-ups and history ----------------------------------------------------------------
 
     def asks(self):
-        return [json.loads(l) for l in (self.repo / ".orc" / "asks" / "asks.jsonl").read_text().splitlines()]
+        return [json.loads(l) for l in (self.repo / ".orc" / "asks" / "asks.jsonl").read_text(encoding="utf-8").splitlines()]
 
     def test_ask_follow_up_resumes_the_same_thread(self):
         self.orc("statusline", stdin=json.dumps({"session_id": "s3", "workspace": {"project_dir": str(self.repo)}}))
@@ -690,7 +769,7 @@ class OrcTest(unittest.TestCase):
         self.assertIn("model=gpt-6-luna effort=xhigh", p.stdout)                        # keeps the thread's model and effort
         self.assertIn(f"(follow-up to {first})", p.stdout)
         self.assertEqual((asks[1]["parent"], asks[1]["root"]), (first, first))
-        prompt = (self.repo / ".orc" / "asks" / f"{asks[1]['id']}.prompt.md").read_text()
+        prompt = (self.repo / ".orc" / "asks" / f"{asks[1]['id']}.prompt.md").read_text(encoding="utf-8")
         self.assertTrue(prompt.startswith("## Follow-up question\nand a follow-up?"))  # no repeated preamble
         p = self.orc("ask", "--continue", "last", "--model", "sol", "third?")        # `last`; explicit flags still win
         asks = self.asks()
@@ -741,13 +820,13 @@ class OrcTest(unittest.TestCase):
         p = self.orc("ask", "--continue", f"{run_id}/impl-a", "why this approach?")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn(f"[cwd=impl-a sandbox=read-only resume={thread}]", p.stdout)     # its worktree, read-only
-        prompt = (self.repo / ".orc" / "asks" / f"{self.asks()[-1]['id']}.prompt.md").read_text()
+        prompt = (self.repo / ".orc" / "asks" / f"{self.asks()[-1]['id']}.prompt.md").read_text(encoding="utf-8")
         self.assertIn("not a new task", prompt)
         self.assertIn("plain prose, not JSON", prompt)
         self.orc("merge", run_id)                                                         # worktree removed after merge
         p = self.orc("ask", "--continue", f"{run_id}/impl-a", "and now?")
         self.assertIn("[cwd=repo sandbox=read-only", p.stdout)
-        self.assertIn("contains your merged changes", (self.repo / ".orc" / "asks" / f"{self.asks()[-1]['id']}.prompt.md").read_text())
+        self.assertIn("contains your merged changes", (self.repo / ".orc" / "asks" / f"{self.asks()[-1]['id']}.prompt.md").read_text(encoding="utf-8"))
         p = self.orc("show")
         self.assertIn(f"→ {run_id}/impl-a", p.stdout)
         self.assertIn("impl-a checks-passed (merged)", p.stdout)
@@ -802,8 +881,8 @@ class OrcTest(unittest.TestCase):
         self.assertEqual(more["calls"][0]["thread"], thread)                               # warm thread, resumed
         self.assertEqual(more["continues"], f"{run_a}/impl-a")
         self.assertTrue((Path(more["worktree"]) / "impl-a.txt").exists())                  # fresh worktree from HEAD
-        self.assertTrue(more["worktree"].endswith("/more"))
-        prompt = (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text()
+        self.assertEqual(Path(more["worktree"]).name, "more")
+        prompt = (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text(encoding="utf-8")
         self.assertTrue(prompt.startswith(f"## Follow-up to your earlier work ({run_a}/impl-a)"))
         self.assertIn("are already in this checkout", prompt)
         self.assertIn("## Your task: more\nextend it", prompt)
@@ -830,7 +909,7 @@ class OrcTest(unittest.TestCase):
         p = self.orc("run", "b.toml")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         run_b, st = self.state()
-        prompt = (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text()
+        prompt = (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text(encoding="utf-8")
         self.assertIn(f"NOT in this checkout (they are on orc/{run_a}/impl-a", prompt)
         for ref, err in ((f"{run_b}/nope", "no task nope"), ("20990101-000000/x", "no run 20990101-000000"),
                          ("last", "`continues` must be"), ("0101-000000-000", "`continues` must be"), ("bad ref!", "`continues` must be")):
@@ -889,7 +968,7 @@ class OrcTest(unittest.TestCase):
         # a thread tainted any other way (e.g. by an older orc) is refused for steer and continues
         thread = st["tasks"]["impl-a"]["calls"][0]["thread"]
         (self.repo / ".orc" / "asks").mkdir(exist_ok=True)
-        with open(self.repo / ".orc" / "asks" / "asks.jsonl", "a") as f:
+        with open(self.repo / ".orc" / "asks" / "asks.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps({"id": "0101-000000-000", "thread": thread, "web": True}) + "\n")
         p = self.orc("steer", run_a, "impl-a", "more")
         self.assertEqual(p.returncode, 1)
@@ -931,7 +1010,7 @@ class OrcTest(unittest.TestCase):
         _, st = self.state()
         self.assertEqual(st["tasks"]["more"]["calls"][0]["thread"], thread)
         self.assertTrue((Path(st["tasks"]["more"]["worktree"]) / "gate.txt").exists())
-        self.assertIn("## Follow-up to your earlier work", (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text())
+        self.assertIn("## Follow-up to your earlier work", (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text(encoding="utf-8"))
         # continue again; the continued call fails its check, repairs on the same thread, then steers
         self.plan("c.toml", self.FOLLOW.replace("{ref}", f"{run_b}/more").replace("extend it", "FAKE_BREAK_UNTIL_STEER")
                   .replace('checks = ["true"]', 'checks = ["! grep -rq BROKEN --include=*.txt ."]'))
@@ -961,19 +1040,19 @@ class OrcTest(unittest.TestCase):
         self.assertIn("[cwd=impl-a sandbox=read-only", p.stdout)
         x = self.asks()[-1]
         self.assertEqual((x["parent"], x["root"]), (first, f"{run_a}/impl-a"))
-        prompt = (self.repo / ".orc" / "asks" / f"{x['id']}.prompt.md").read_text()
+        prompt = (self.repo / ".orc" / "asks" / f"{x['id']}.prompt.md").read_text(encoding="utf-8")
         self.assertIn(f"your work on `{run_a}/impl-a`, not a new task", prompt)
         self.assertEqual(self.orc("ask", "--continue", first, "--web", "q").returncode, 1)
         self.orc("clean", run_a)
         p = self.orc("ask", "--continue", f"{run_a}/impl-a", "third?")
         self.assertIn("[cwd=repo", p.stdout)
         self.assertIn("your worktree was removed and your changes are not in it",
-                      (self.repo / ".orc" / "asks" / f"{self.asks()[-1]['id']}.prompt.md").read_text())
+                      (self.repo / ".orc" / "asks" / f"{self.asks()[-1]['id']}.prompt.md").read_text(encoding="utf-8"))
         self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
         self.assertEqual(self.orc("run", "b.toml").returncode, 0)
         run_b, _ = self.state()
         self.assertIn("NOT in this checkout (their branch was removed)",
-                      (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text())
+                      (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text(encoding="utf-8"))
         p = self.orc("show")                                                              # one conversation per worker
         self.assertEqual(p.stdout.count(f"→ {run_a}/impl-a"), 1)
         self.assertIn("first?", p.stdout)
@@ -996,7 +1075,7 @@ class OrcTest(unittest.TestCase):
         p = self.orc("ask", "--continue", "last", "q2")
         self.assertEqual(p.returncode, 1)
         self.assertIn("no earlier ask in this Claude session", p.stderr)
-        with open(self.repo / ".orc" / "asks" / "asks.jsonl", "a") as f:
+        with open(self.repo / ".orc" / "asks" / "asks.jsonl", "a", encoding="utf-8") as f:
             f.write('"junk"\n[1]\nnot json\n')
         self.plan("a.toml", self.ONE)
         self.orc("run", "a.toml")
@@ -1004,7 +1083,7 @@ class OrcTest(unittest.TestCase):
         (self.repo / ".orc" / "runs" / run_a / "plan.toml").unlink()
         bad = self.repo / ".orc" / "runs" / "20200101-000000"
         bad.mkdir()
-        (bad / "state.json").write_text("[]")
+        (bad / "state.json").write_text("[]", encoding="utf-8")
         p = self.orc("show")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn(run_a, p.stdout)
@@ -1055,7 +1134,7 @@ class OrcTest(unittest.TestCase):
         run_w, _ = self.state()
         self.plan("i.toml", self.FOLLOW.replace("{ref}", f"{run_w}/more"))
         self.assertIn("used web search", self.orc("check", "i.toml").stdout)
-        (self.repo / ".orc" / "runs" / run_w / "plan.toml").write_text("not toml [")
+        (self.repo / ".orc" / "runs" / run_w / "plan.toml").write_text("not toml [", encoding="utf-8")
         self.assertIn("used web search", self.orc("check", "i.toml").stdout)
 
     def test_web_is_recorded_in_state_and_survives_a_lost_plan(self):
@@ -1083,17 +1162,17 @@ class OrcTest(unittest.TestCase):
         run_a, st = self.state()
         path = self.repo / ".orc" / "runs" / run_a / "state.json"
         st["tasks"]["impl-a"].update(status="running", pid=os.getpid())                  # a live orc process holds it
-        path.write_text(json.dumps(st))
+        path.write_text(json.dumps(st), encoding="utf-8")
         for args in (("ask", "--continue", f"{run_a}/impl-a", "q"), ("steer", run_a, "impl-a", "x")):
             p = self.orc(*args)
             self.assertEqual(p.returncode, 1, args)
             self.assertIn("is running right now", p.stderr)
         self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
         self.assertIn("is running right now", self.orc("check", "b.toml").stdout)
-        dead = subprocess.Popen(["true"])
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
         dead.wait()
         st["tasks"]["impl-a"]["pid"] = dead.pid                                          # its process died: usable again
-        path.write_text(json.dumps(st))
+        path.write_text(json.dumps(st), encoding="utf-8")
         self.assertEqual(self.orc("ask", "--continue", f"{run_a}/impl-a", "q").returncode, 0)
 
     def test_malformed_runs_do_not_break_other_commands(self):
@@ -1105,7 +1184,7 @@ class OrcTest(unittest.TestCase):
                             ("20200101-000003", {"tasks": {"t": {"calls": [1, {"thread": "x"}, {"name": None, "thread": "y"}]}}}),
                             ("20200101-000004", {"tasks": {"t": "junk"}, "continues": ["x"]})):
             (runs / name).mkdir()
-            (runs / name / "state.json").write_text(json.dumps(state))
+            (runs / name / "state.json").write_text(json.dumps(state), encoding="utf-8")
         self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
         for args in (("check", "b.toml"), ("show",), ("show", f"{run_a}/impl-a"), ("ask", "--continue", f"{run_a}/impl-a", "q"),
                      ("steer", run_a, "impl-a", "again")):
@@ -1116,7 +1195,7 @@ class OrcTest(unittest.TestCase):
         runs = self.repo / ".orc" / "runs"
         for name in ("20260930-101010", "20260930-101010-2", "20260930-101010-10"):
             (runs / name).mkdir(parents=True)
-            (runs / name / "state.json").write_text(json.dumps({"id": name, "goal": f"goal {name}", "order": [], "tasks": {}}))
+            (runs / name / "state.json").write_text(json.dumps({"id": name, "goal": f"goal {name}", "order": [], "tasks": {}}), encoding="utf-8")
         out = self.orc("show").stdout
         self.assertLess(out.index("goal 20260930-101010-10"), out.index("goal 20260930-101010-2"))
         self.assertIn("run 20260930-101010-10 ", self.orc("resume").stderr)                 # the latest run
@@ -1138,6 +1217,7 @@ class OrcTest(unittest.TestCase):
             import runpy, sys, time
             from pathlib import Path
             from types import SimpleNamespace
+            sys.stdout.reconfigure(encoding="utf-8")  # main() does this; cmd_run is called directly here
             mod = runpy.run_path({ORC[1]!r}, run_name="claim_test")
             original = mod["resolve_continues"]
             def slow_resolve(*args):
@@ -1156,7 +1236,7 @@ class OrcTest(unittest.TestCase):
         '''))
         go = self.tmp / "go"
         processes = [subprocess.Popen([sys.executable, str(driver), str(self.tmp / f"ready{i}"), str(go)],
-                        cwd=self.repo, env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        cwd=self.repo, env=self.env, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                      for i in range(2)]
         try:
             for i, process in enumerate(processes):
@@ -1165,7 +1245,7 @@ class OrcTest(unittest.TestCase):
             outputs = [p.communicate(timeout=10) for p in processes]
             self.assertEqual(sorted(p.returncode for p in processes), [0, 1], outputs)
             self.assertIn("continued by", "".join(out + err for out, err in outputs))
-            states = [json.loads(p.read_text()) for p in (self.repo / ".orc" / "runs").glob("*/state.json")]
+            states = [json.loads(p.read_text(encoding="utf-8")) for p in (self.repo / ".orc" / "runs").glob("*/state.json")]
             self.assertEqual(sum(bool(st.get("continues")) for st in states), 1)
         finally:
             for p in processes:
@@ -1188,13 +1268,13 @@ class OrcTest(unittest.TestCase):
                 self.plan("c.toml", self.FOLLOW.replace("{ref}", f"{run_b}/more"))
                 self.assertEqual(self.orc("run", "c.toml").returncode, 0)
                 run_c, _ = self.state()
-                before = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text())["calls"]
+                before = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text(encoding="utf-8"))["calls"]
                 p = self.orc("resume", run_b)
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertIn(f"continued by {run_c}/more", p.stdout)
-                disk = json.loads((self.repo / ".orc" / "runs" / run_b / "state.json").read_text())
+                disk = json.loads((self.repo / ".orc" / "runs" / run_b / "state.json").read_text(encoding="utf-8"))
                 self.assertEqual(disk["tasks"]["more"]["calls"], [])
-                after = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text())["calls"]
+                after = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text(encoding="utf-8"))["calls"]
                 self.assertEqual(before, after)
                 # Use a new independent thread for the next role.
                 self.assertEqual(self.orc("run", "a.toml").returncode, 0)
@@ -1209,7 +1289,7 @@ class OrcTest(unittest.TestCase):
         gate = self.tmp / "question"
         env = dict(self.env, ORC_FAKE_GATE=str(gate))
         process = subprocess.Popen(ORC + ["ask", "--continue", ref, "FAKE_HOLD why?"], cwd=self.repo,
-                                   env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                   env=env, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             self.wait_file(gate.with_suffix(".ready"), process)
             for args in (("ask", "--continue", ref, "q"), ("steer", run_a, "impl-a", "q"),
@@ -1224,7 +1304,7 @@ class OrcTest(unittest.TestCase):
             out, err = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 0, out + err)
         self.assertEqual(self.orc("ask", "--continue", ref, "q").returncode, 1)
-        self.env["ORC_CODEX_BIN"] = str(ROOT / "tests" / "fake_codex.py")
+        self.env["ORC_CODEX_BIN"] = codex_bin(ROOT / "tests" / "fake_codex.py")
         self.assertEqual(self.orc("ask", "--continue", ref, "q").returncode, 0)
         self.assertEqual(self.orc("run", "b.toml").returncode, 0)
 
@@ -1233,7 +1313,7 @@ class OrcTest(unittest.TestCase):
         ref = self.asks()[-1]["id"]
         gate = self.tmp / "conversation"
         process = subprocess.Popen(ORC + ["ask", "--continue", ref, "FAKE_HOLD q"], cwd=self.repo,
-                                   env=dict(self.env, ORC_FAKE_GATE=str(gate)), text=True,
+                                   env=dict(self.env, ORC_FAKE_GATE=str(gate)), text=True, encoding="utf-8", errors="replace",
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             self.wait_file(gate.with_suffix(".ready"), process)
@@ -1256,7 +1336,7 @@ class OrcTest(unittest.TestCase):
         run_b, _ = self.state()
         gate = self.tmp / "recovery"
         process = subprocess.Popen(ORC + ["ask", "--continue", f"{run_b}/more", "FAKE_HOLD q"],
-                                   cwd=self.repo, env=dict(self.env, ORC_FAKE_GATE=str(gate)), text=True,
+                                   cwd=self.repo, env=dict(self.env, ORC_FAKE_GATE=str(gate)), text=True, encoding="utf-8", errors="replace",
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             self.wait_file(gate.with_suffix(".ready"), process)
@@ -1277,7 +1357,7 @@ class OrcTest(unittest.TestCase):
         config = Path(self.env["CODEX_HOME"]) / "config.toml"
         for mode in ("cached", "live"):
             with self.subTest(mode=mode):
-                config.write_text(f'web_search = "{mode}"\n')
+                config.write_text(f'web_search = "{mode}"\n', encoding="utf-8")
                 self.plan("a.toml", self.ONE)
                 self.assertEqual(self.orc("run", "a.toml").returncode, 0)
                 run_a, _ = self.state()
@@ -1285,7 +1365,7 @@ class OrcTest(unittest.TestCase):
                 self.assertEqual(p.returncode, 0, p.stderr)
                 self.assertIn("web=False", p.stdout)
                 self.assertEqual(self.orc("ask", "--continue", "last", "q2").returncode, 0)
-                state = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text())
+                state = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text(encoding="utf-8"))
                 for call in state["invocations"][-3:]:
                     self.assertEqual(call["web_search"], "disabled", call)
                 self.assertIsNotNone(state["invocations"][-1]["resume"])
@@ -1300,7 +1380,7 @@ class OrcTest(unittest.TestCase):
         for legacy in (False, True):
             if legacy:
                 del st["tasks"]["review"]["cwd"]
-                (self.repo / ".orc" / "runs" / run_a / "state.json").write_text(json.dumps(st))
+                (self.repo / ".orc" / "runs" / run_a / "state.json").write_text(json.dumps(st), encoding="utf-8")
             p = self.orc("ask", "--continue", f"{run_a}/review", "q")
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertIn("[cwd=impl-a sandbox=read-only", p.stdout)
@@ -1323,7 +1403,7 @@ class OrcTest(unittest.TestCase):
                     st[key] = value
                 else:
                     st["tasks"]["impl-a"][key] = value
-                path.write_text(json.dumps(st))
+                path.write_text(json.dumps(st), encoding="utf-8")
                 p = self.orc("show", f"{run_a}/impl-a")
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
                 self.assertIn("unreadable", p.stderr)
@@ -1334,29 +1414,29 @@ class OrcTest(unittest.TestCase):
                     self.assertNotIn("Traceback", p.stderr)
         original["tasks"]["bad"] = {"id": "bad", "status": "done", "calls": [1]}
         original["order"].append("bad")
-        path.write_text(json.dumps(original))
+        path.write_text(json.dumps(original), encoding="utf-8")
         for args in (("show",), ("show", run_a), ("show", f"{run_a}/impl-a")):
             p = self.orc(*args)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("impl-a", p.stdout)
         asks = self.repo / ".orc" / "asks"
         asks.mkdir(exist_ok=True)
-        with open(asks / "asks.jsonl", "a") as f:
+        with open(asks / "asks.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps({"id": "bad", "root": [], "question": [1]}) + "\n")
         self.assertEqual(self.orc("show").returncode, 0)
 
 
 class PackagingTest(unittest.TestCase):
     def test_dist_skills_match_sources(self):
-        p = subprocess.run([sys.executable, str(ROOT / "tools" / "build_skills.py"), "--check"], text=True, capture_output=True)
+        p = subprocess.run([sys.executable, str(ROOT / "tools" / "build_skills.py"), "--check"], text=True, encoding="utf-8", errors="replace", capture_output=True)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
 
     def test_plugin_layout(self):
-        manifest = json.loads((ROOT / "plugin" / ".claude-plugin" / "plugin.json").read_text())
-        market = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text())
+        manifest = json.loads((ROOT / "plugin" / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        market = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
         self.assertEqual(market["plugins"][0]["name"], manifest["name"])
         self.assertTrue((ROOT / market["plugins"][0]["source"] / "skills" / "orchestrate" / "SKILL.md").exists())
-        skill = (ROOT / "plugin" / "skills" / "orchestrate" / "SKILL.md").read_text()
+        skill = (ROOT / "plugin" / "skills" / "orchestrate" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/orc *)", skill)
 
 

@@ -75,4 +75,4 @@ How a task runs:
 - A read-only task that comes after an implementer (directly or through other read-only tasks) runs in that implementer's worktree, so it sees the new code. An implementer that comes after one branches from its branch.
 - A failed worker, repair, or steer cannot pass on the strength of final JSON alone. Partial implementation work is committed for recovery. A verifier execution error produces `uncertain`, even if its final JSON says `pass`.
 - `resume` reuses a quota-skipped implementer's existing worktree and call history. Partial merges retain branches and worktrees while unfinished tasks still need them. Merge refuses to run during another Git operation and leaves dirty worktrees available for inspection.
-- Checks run on your machine, outside Codex's sandbox, on code a worker wrote. Only use `checks` you would run yourself on an untrusted branch.
+- Checks are POSIX shell (Git Bash on Windows). They run on your machine, outside Codex's sandbox, on code a worker wrote. Only use `checks` you would run yourself on an untrusted branch.

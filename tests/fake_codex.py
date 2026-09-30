@@ -12,7 +12,6 @@ first prompt of a thread (remembered per thread, so resumes keep the mode):
   (FAKE_BREAK_UNTIL_STEER and FAKE_BLOCKED also switch on when a resumed thread's prompt contains them)
 Workers report the directory they ran in ("fake worker in <dir name>").
 """
-import fcntl
 import json
 import os
 import sys
@@ -49,12 +48,22 @@ if resume and cwd.name == "impl-a":
 thread = resume or str(uuid.uuid4())
 home = Path(os.environ["CODEX_HOME"])
 state = home / "fake-state.json"
-lock = open(home / "fake.lock", "w")
-fcntl.flock(lock, fcntl.LOCK_EX)  # parallel fake workers share the state file
-st = json.loads(state.read_text()) if state.exists() else {"calls": 0, "verifier_failed": False}
+lock = open(home / "fake.lock", "w", encoding="utf-8")
+if os.name == "nt":  # parallel fake workers share the state file
+    import msvcrt
+    while True:
+        try:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            break
+        except OSError:
+            time.sleep(0.02)
+else:
+    import fcntl
+    fcntl.flock(lock, fcntl.LOCK_EX)
+st = json.loads(state.read_text(encoding="utf-8")) if state.exists() else {"calls": 0, "verifier_failed": False}
 st["calls"] += 1
 config = home / "config.toml"
-search = tomllib.loads(config.read_text()).get("web_search", "cached") if config.exists() else "cached"
+search = tomllib.loads(config.read_text(encoding="utf-8")).get("web_search", "cached") if config.exists() else "cached"
 for arg in args:
     if arg.startswith("web_search="):
         search = arg.split("=", 1)[1].strip('"')
@@ -73,10 +82,10 @@ if schema is None:  # orc ask: plain-text answer that echoes how it was called
         final = f"## Summary\n- fake research finding ({info})\n\n## Details\nlong details\n\n## Sources\n1. https://example.com\n"
     else:
         final = f"fake answer ({info}) [cwd={cwd.name} sandbox={sandbox} resume={resume}]"
-    Path(out).write_text(final)
+    Path(out).write_text(final, encoding="utf-8")
     print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5000, "cached_input_tokens": 1000,
                                                            "output_tokens": 500, "reasoning_output_tokens": 200}}))
-    state.write_text(json.dumps(st))
+    state.write_text(json.dumps(st), encoding="utf-8")
     sys.exit(0)
 
 if schema.endswith("verdict.schema.json"):
@@ -100,22 +109,22 @@ else:
     if sandbox == "workspace-write":
         target = cwd / f"{cwd.name}.txt"
         broken = (mode.get("FAKE_BREAK_CHECK") and not resume) or mode.get("FAKE_BREAK_UNTIL_STEER")
-        target.write_text(("BROKEN" if broken else "ok") + f" {st['calls']}\n")
+        target.write_text(("BROKEN" if broken else "ok") + f" {st['calls']}\n", encoding="utf-8")
         changes = [{"path": target.name, "what": "wrote fake output"}]
     final = {"status": "blocked" if mode.get("FAKE_BLOCKED") else "done",
              "summary": f"fake worker in {cwd.name}", "findings": ["fake finding at a.py:1"],
              "changes": changes, "claims": ["fake.txt exists"], "commands_run": [{"cmd": "true", "exit_code": 0}],
              "open_questions": []}
 
-Path(out).write_text(json.dumps(final))
+Path(out).write_text(json.dumps(final), encoding="utf-8")
 print(json.dumps({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": json.dumps(final)}}))
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10000, "cached_input_tokens": 6000,
                                                        "output_tokens": 1000, "reasoning_output_tokens": 400}}))
 day = home / "sessions" / "2026" / "09" / "30"
 day.mkdir(parents=True, exist_ok=True)
-with open(day / f"rollout-2026-09-30T10-00-00-{thread}.jsonl", "a") as f:
+with open(day / f"rollout-2026-09-30T10-00-00-{thread}.jsonl", "a", encoding="utf-8") as f:
     f.write(json.dumps({"timestamp": "2026-09-30T10:00:00Z", "type": "event_msg", "payload": {
         "type": "token_count", "info": {"total_token_usage": {"total_tokens": 11000}},
         "rate_limits": {"primary": {"used_percent": 10 + st["calls"], "window_minutes": 300, "resets_at": 1790000000},
                         "secondary": {"used_percent": 40 + st["calls"] / 10, "window_minutes": 10080, "resets_at": 1790500000}}}}) + "\n")
-state.write_text(json.dumps(st))
+state.write_text(json.dumps(st), encoding="utf-8")

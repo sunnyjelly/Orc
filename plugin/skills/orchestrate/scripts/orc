@@ -35,6 +35,7 @@ SCHEMAS = ROOT / "schemas"
 PRICING = ROOT / "pricing.toml"
 ORC_HOME = Path(os.environ.get("ORC_HOME", Path.home() / ".orc"))
 CODEX = os.environ.get("ORC_CODEX_BIN", "codex")
+CODEX = shutil.which(CODEX) or CODEX  # Windows: npm installs codex.cmd, which CreateProcess won't find by bare name
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 
 DEFAULT_MODEL = "gpt-6.1-sol"
@@ -59,7 +60,7 @@ def die(msg: str, code: int = 1):
 
 
 def sh(cmd: list[str], cwd=None, check=True) -> str:
-    p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+    p = run_argv(cmd, cwd=cwd, text=True, encoding="utf-8", errors="replace", capture_output=True)
     if check and p.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd)} failed: {p.stderr.strip() or p.stdout.strip()}")
     return p.stdout.strip()
@@ -67,6 +68,45 @@ def sh(cmd: list[str], cwd=None, check=True) -> str:
 
 def git(*args, cwd=None, check=True) -> str:
     return sh(["git", *args], cwd=cwd, check=check)
+
+
+def run_argv(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    """Keep argv literal even when Windows runs an npm .cmd launcher through cmd.exe."""
+    if os.name == "nt" and Path(cmd[0]).suffix.lower() in (".cmd", ".bat"):
+        if any(any(c in arg for c in "\r\n\0") for arg in cmd):
+            raise ValueError("batch launcher arguments cannot contain newlines or NUL")
+        meta = re.compile(r'([()\[\]%!^"`<>&|;, *?])')
+        escape = lambda s: meta.sub(r'^\1', s)
+        def argument(s):
+            # First quote for the child's argv parser, then escape for cmd.exe.
+            s = re.sub(r'(\\*)"', r'\1\1\"', s)
+            s = re.sub(r'(\\*)$', r'\1\1', s)
+            return escape('"' + s + '"')
+        command = escape(str(Path(cmd[0]))) + " " + " ".join(argument(s) for s in cmd[1:])
+        shell = os.environ.get("COMSPEC", str(Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe"))
+        # A string avoids list2cmdline re-quoting the already escaped /c payload.
+        cmd = f'"{shell}" /d /s /v:off /c "{command}"'
+    return subprocess.run(cmd, **kw)
+
+
+_BASH: list[str] = []
+
+
+def git_bash() -> str:
+    """Windows: the Git Bash that runs plan checks (plans are POSIX shell, like Claude Code's own Bash tool)."""
+    if not _BASH:
+        env = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
+        path = Path(env) if env else Path(git("--exec-path")).parents[2] / "bin" / "bash.exe"
+        if not path.is_file():
+            raise RuntimeError(f"Git Bash not found at {path}; install Git for Windows or set CLAUDE_CODE_GIT_BASH_PATH")
+        _BASH.append(str(path))
+    return _BASH[0]
+
+
+def run_shell(cmd: str, **kw) -> subprocess.CompletedProcess:
+    if os.name == "nt":
+        return subprocess.run([git_bash(), "-c", cmd], **kw)
+    return subprocess.run(cmd, shell=True, **kw)
 
 
 def now_iso() -> str:
@@ -98,20 +138,20 @@ def tail(text: str, lines: int = 25) -> str:
 
 def write_json(path: Path, data) -> None:
     tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")  # unique: parallel writers
-    tmp.write_text(json.dumps(data, indent=2))
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     tmp.replace(path)
 
 
 def read_json(path: Path, default=None):
     try:
-        return json.loads(Path(path).read_text())
+        return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return default
 
 
 def read_jsonl(path: Path) -> list[dict]:
     try:
-        lines = Path(path).read_text().splitlines()
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
     out = []
@@ -229,7 +269,7 @@ def add_usage(a: dict, b: dict) -> dict:
 
 def load_pricing() -> dict:
     try:
-        return tomllib.loads(PRICING.read_text())
+        return tomllib.loads(PRICING.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):
         return {}
 
@@ -270,7 +310,7 @@ def _find_key(obj, key):
 
 def _limits_in_rollout(path: Path):
     try:
-        lines = path.read_text(errors="replace").splitlines()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return None
     for line in reversed(lines):
@@ -289,10 +329,11 @@ def _limits_in_rollout(path: Path):
 def recent_rollouts(limit: int = 8) -> list[Path]:
     base = CODEX_HOME / "sessions"
     files: list[Path] = []
+    dirs = lambda p: sorted((c for c in p.iterdir() if c.is_dir()), reverse=True)  # old Codex left files at the top
     try:
-        for y in sorted(base.iterdir(), reverse=True):
-            for m in sorted(y.iterdir(), reverse=True):
-                for d in sorted(m.iterdir(), reverse=True):
+        for y in dirs(base):
+            for m in dirs(y):
+                for d in dirs(m):
                     files += d.glob("rollout-*.jsonl")
                     if len(files) >= limit:
                         raise StopIteration
@@ -394,7 +435,7 @@ def claude_tokens(transcript: str | None) -> dict:
     seen = set()
     for f in files:
         try:
-            lines = f.read_text(errors="replace").splitlines()
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
         for line in lines:
@@ -428,8 +469,8 @@ def resolve_model(name: str) -> str:
 def load_plan(path: str) -> tuple[dict, list[str], list[str]]:
     """Parse and validate a plan. Returns (plan, errors, warnings)."""
     try:
-        plan = tomllib.loads(Path(path).read_text())
-    except (OSError, tomllib.TOMLDecodeError) as e:
+        plan = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as e:
         return {}, [f"cannot read plan: {e}"], []
     errs, warns = [], []
     def integer(value, field, minimum, default):
@@ -647,6 +688,23 @@ def task_thread(rec: dict) -> str | None:
 
 
 def pid_alive(pid) -> bool:
+    if os.name == "nt":  # os.kill(pid, 0) sends CTRL_C_EVENT on Windows; ask the kernel instead
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        try:
+            h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not h:
+            return ctypes.get_last_error() == 5  # access denied: it exists
+        code = ctypes.c_ulong()
+        try:
+            return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
     try:
         os.kill(int(pid), 0)
     except PermissionError:
@@ -678,7 +736,7 @@ def codex_exec(*, model: str, effort: str, sandbox: str, cwd: Path, prompt: str,
         cmd += ["resume", resume]
     cmd.append("-")
     logdir.mkdir(parents=True, exist_ok=True)
-    (logdir / f"{name}.prompt.md").write_text(prompt)
+    (logdir / f"{name}.prompt.md").write_text(prompt, encoding="utf-8")
     rec = {"name": name, "thread": None, "usage": {k: 0 for k in USAGE_KEYS}, "final": None, "error": None,
            "effort": effort, "model": model}
     with (slots or threading.Semaphore()):
@@ -687,16 +745,18 @@ def codex_exec(*, model: str, effort: str, sandbox: str, cwd: Path, prompt: str,
             return rec
         out.unlink(missing_ok=True)  # a failed retry must never reuse an earlier final message
         start = time.time()
-        with open(logdir / f"{name}.events.jsonl", "w") as ev, open(logdir / f"{name}.stderr.log", "w") as er:
+        with open(logdir / f"{name}.events.jsonl", "w", encoding="utf-8") as ev, open(logdir / f"{name}.stderr.log", "w", encoding="utf-8") as er:
             try:
-                p = subprocess.run(cmd, input=prompt, text=True, stdout=ev, stderr=er, timeout=timeout_min * 60)
+                p = run_argv(cmd, input=prompt, text=True, encoding="utf-8", errors="replace", stdout=ev, stderr=er, timeout=timeout_min * 60)
                 rc = p.returncode
             except subprocess.TimeoutExpired:
                 rc = "timeout"
             except FileNotFoundError:
                 rc = "codex not found (set ORC_CODEX_BIN or install @openai/codex)"
+            except (OSError, ValueError) as e:
+                rc = f"codex launch failed: {e}"
         rec["seconds"] = round(time.time() - start, 1)
-        for line in (logdir / f"{name}.events.jsonl").read_text(errors="replace").splitlines():
+        for line in (logdir / f"{name}.events.jsonl").read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 ev = json.loads(line)
             except ValueError:
@@ -710,12 +770,13 @@ def codex_exec(*, model: str, effort: str, sandbox: str, cwd: Path, prompt: str,
                 rec["error"] = clip((ev.get("error") or {}).get("message") or ev.get("message") or kind, 300)
         rec["thread"] = rec["thread"] or resume
         try:
-            text = out.read_text()
+            text = out.read_text(encoding="utf-8")
             rec["final"] = json.loads(text) if schema else (text.strip() or None)
         except (OSError, ValueError):
             pass
         if rec["final"] is None and not rec["error"]:
-            rec["error"] = f"exit {rc}; no valid final message" + (f": {clip(tail((logdir / f'{name}.stderr.log').read_text(), 3), 300)}" if rc else "")
+            detail = clip(tail((logdir / f"{name}.stderr.log").read_text(encoding="utf-8"), 3), 300) if rc else ""
+            rec["error"] = f"exit {rc}; no valid final message" + (f": {detail}" if rc else "")
         if rc not in (0, None) and not rec["error"]:
             rec["error"] = f"exit {rc}"
         rec["cost"] = round(openai_cost(model, rec["usage"], pricing if pricing is not None else load_pricing()), 4)
@@ -772,7 +833,7 @@ class Run:
         return "\n".join(lines)
 
     def worker_prompt(self, t: dict, cwd: Path | None = None) -> str:
-        parts = [(PROMPTS / f"{t['role']}.md").read_text().strip(), f"## Team goal\n{self.plan['goal']}"]
+        parts = [(PROMPTS / f"{t['role']}.md").read_text(encoding="utf-8").strip(), f"## Team goal\n{self.plan['goal']}"]
         if (src := self.continued(t)):
             parts.insert(0, self.continuation(src, cwd or self.repo or Path.cwd()))
         if self.plan.get("context"):
@@ -803,7 +864,7 @@ class Run:
 
     def review_prompt(self, t: dict, kind: str, base: str, rec: dict) -> str:
         res = rec.get("result") or {}
-        parts = [(PROMPTS / f"{kind}.md").read_text().strip().replace("{base}", base),
+        parts = [(PROMPTS / f"{kind}.md").read_text(encoding="utf-8").strip().replace("{base}", base),
                  f"## Goal of the change\n{self.plan['goal']}", f"## Task given to the implementer\n{t['brief'].strip()}"]
         if self.plan.get("context"):
             parts.append(f"## Shared context and decisions\n{self.plan['context'].strip()}")
@@ -822,13 +883,13 @@ class Run:
         results, log = [], []
         for cmd in t["checks"]:
             try:
-                p = subprocess.run(cmd, shell=True, cwd=cwd, text=True, capture_output=True, timeout=900)
+                p = run_shell(cmd, cwd=cwd, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=900)
                 code, out = p.returncode, (p.stdout or "") + (p.stderr or "")
             except subprocess.TimeoutExpired:
                 code, out = "timeout", "check timed out after 15 minutes"
             results.append({"cmd": cmd, "exit": code, "tail": tail(out, 25)})
             log.append(f"$ {cmd}\n[exit {code}]\n{out}\n")
-        (self.dir / t["id"] / f"checks.{round_no}.log").write_text("\n".join(log))
+        (self.dir / t["id"] / f"checks.{round_no}.log").write_text("\n".join(log), encoding="utf-8")
         # drop whatever the checks produced (coverage files, build output) so it is never committed
         git("reset", "-q", "--hard", "HEAD", cwd=cwd, check=False)
         git("clean", "-fdq", cwd=cwd, check=False)
@@ -1172,9 +1233,9 @@ def runs_dir(repo: Path | None) -> Path:
     if repo:
         exclude = Path(git("rev-parse", "--git-path", "info/exclude", cwd=repo))
         exclude = exclude if exclude.is_absolute() else repo / exclude
-        if ".orc/" not in (exclude.read_text() if exclude.exists() else ""):
+        if ".orc/" not in (exclude.read_text(encoding="utf-8", errors="replace") if exclude.exists() else ""):
             exclude.parent.mkdir(parents=True, exist_ok=True)
-            with open(exclude, "a") as f:
+            with open(exclude, "a", encoding="utf-8") as f:
                 f.write("\n.orc/\n")
     return d
 
@@ -1219,8 +1280,8 @@ def state_tasks(st: dict) -> dict:
 def plan_task(run_dir: Path, tid: str) -> dict | None:
     """A task's entry in a run's plan.toml; {} if it has none, None if the plan can't be read."""
     try:
-        tasks = tomllib.loads((run_dir / "plan.toml").read_text()).get("task", [])
-    except (OSError, tomllib.TOMLDecodeError):
+        tasks = tomllib.loads((run_dir / "plan.toml").read_text(encoding="utf-8")).get("task", [])
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
         return None
     return next((t for t in tasks if isinstance(t, dict) and t.get("id") == tid), {}) if isinstance(tasks, list) else None
 
@@ -1385,7 +1446,7 @@ def cmd_run(a) -> int:
                     break
                 except FileExistsError:
                     run_id = f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{n}"
-            (run_dir / "plan.toml").write_text(Path(a.plan).read_text())
+            (run_dir / "plan.toml").write_text(Path(a.plan).read_text(encoding="utf-8"), encoding="utf-8")
             codex_start = codex_limits()
             save_codex_limits(codex_start)
             claude = claude_snapshot(repo)
@@ -1401,7 +1462,7 @@ def cmd_run(a) -> int:
         state["finished"] = now_iso()
         write_json(run_dir / "state.json", state)
         summary = run_summary(run_dir, state)
-        (run_dir / "summary.md").write_text(summary + "\n")
+        (run_dir / "summary.md").write_text(summary + "\n", encoding="utf-8")
         print(summary)
         return 0 if all(r.get("status") in OK_STATUSES for r in state["tasks"].values()) else 2
 
@@ -1495,7 +1556,7 @@ def cmd_resume(a) -> int:
             run.state["finished"] = now_iso()
             run.save()
             summary = run_summary(run.dir, run.state)
-            (run.dir / "summary.md").write_text(summary + "\n")
+            (run.dir / "summary.md").write_text(summary + "\n", encoding="utf-8")
             print(summary)
             return 0 if all(r.get("status") in OK_STATUSES for r in run.state["tasks"].values()) else 2
     except LockBusy as e:
@@ -1557,7 +1618,7 @@ def cmd_merge(a) -> int:
         if parent and not state["tasks"].get(parent, {}).get("merged"):
             print(f"note: {tid} is built on {parent}, so this also merges {parent}'s commits")
         p = subprocess.run(["git", "merge", "--no-ff", "--no-edit", "-m", f"orc: merge {tid} ({state['goal'][:60]})", r["branch"]],
-                           cwd=repo, text=True, capture_output=True)
+                           cwd=repo, text=True, encoding="utf-8", errors="replace", capture_output=True)
         if p.returncode != 0:
             if git_path("MERGE_HEAD").exists():  # only abort the merge started by this invocation
                 subprocess.run(["git", "merge", "--abort"], cwd=repo, capture_output=True)
@@ -1716,9 +1777,9 @@ def cmd_ask(a) -> int:
     model = resolve_model(a.model or (src or {}).get("model") or "sol")
     effort = a.effort or (src["effort"] if src and src["kind"] == "ask" else None) or "high"
     if not src:
-        prompt = (PROMPTS / ("research.md" if research else "ask.md")).read_text().strip() + f"\n\n## Question\n{question.strip()}\n"
+        prompt = (PROMPTS / ("research.md" if research else "ask.md")).read_text(encoding="utf-8").strip() + f"\n\n## Question\n{question.strip()}\n"
     elif src["kind"] == "ask":
-        prompt = ((PROMPTS / "research.md").read_text().strip() + "\n\n" if a.research and not src.get("research") else "")
+        prompt = ((PROMPTS / "research.md").read_text(encoding="utf-8").strip() + "\n\n" if a.research and not src.get("research") else "")
         prompt += f"## Follow-up question\n{question.strip()}\n" + (f"\n{REPORT_FORMAT}\n" if research else "")
     else:
         wt = Path(src["worktree"]) if src.get("worktree") else None
@@ -1742,7 +1803,7 @@ def cmd_ask(a) -> int:
                      "claude_session": sid, "codex_start": codex_start,
                      **({"parent": src["ref"], "root": src["root"]} if src else {}),
                      **{k: rec.get(k) for k in ("model", "effort", "usage", "cost", "seconds", "thread", "error")}}
-            with open(d / "asks.jsonl", "a") as f:
+            with open(d / "asks.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
     except RuntimeError as e:
         die(str(e))
@@ -1776,7 +1837,7 @@ def show_history(repo: Path | None, needle: str, n: int) -> str:
 
     def read(path):
         try:
-            return Path(path).read_text(errors="replace")
+            return Path(path).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return ""
 
@@ -1876,7 +1937,7 @@ def cmd_show(a) -> int:
         out.append(f"Q {y.get('id')} · {short_model(y.get('model'))} {y.get('effort')}{' · research' if y.get('research') else ''} · "
                    f"{local_time(y.get('at'))}: {y.get('question')}")
         final = ad / f"{y.get('id')}.final.md"
-        text = final.read_text(errors="replace").strip() if final.exists() else ""
+        text = final.read_text(encoding="utf-8", errors="replace").strip() if final.exists() else ""
         if y.get("error") or not text:
             out.append(f"A: (failed: {y.get('error') or 'no answer'})")
         elif y.get("research"):
@@ -1927,7 +1988,7 @@ def cmd_setup(a) -> int:
     if app.resolve() != ROOT:
         shutil.rmtree(app, ignore_errors=True)
         shutil.copytree(ROOT, app, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    command = f'python3 "{app / "orc"}" statusline'
+    command = f'python3 "{(app / "orc").as_posix()}" statusline'
     path = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "settings.json"
     settings = read_json(path) if path.exists() else {}
     if not isinstance(settings, dict):
@@ -1942,7 +2003,7 @@ def cmd_setup(a) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json(path, settings)
         print(f"Status line set in {path} (restart Claude Code to see it).")
-    print(f"orc copied to {app}/orc. For manual use: alias orc='python3 \"{app}/orc\"'")
+    print(f"orc copied to {app}/orc. For manual use: alias orc='python3 \"{(app / 'orc').as_posix()}\"'")
     return 0
 
 
@@ -1955,11 +2016,16 @@ def cmd_doctor(a) -> int:
     try:
         v = sh([CODEX, "--version"])
         line(True, f"codex: {v}")
-        st = subprocess.run([CODEX, "login", "status"], text=True, capture_output=True)
+        st = run_argv([CODEX, "login", "status"], text=True, encoding="utf-8", errors="replace", capture_output=True)
         line(st.returncode == 0, f"codex login: {clip(st.stdout + st.stderr, 120)}")
     except (RuntimeError, FileNotFoundError):
         line(False, "codex CLI not found: npm i -g @openai/codex, then `codex login` (ChatGPT account)")
     line(sys.version_info >= (3, 11), f"python {sys.version.split()[0]} (needs 3.11+)")
+    if os.name == "nt":
+        try:
+            line(True, f"Git Bash for checks: {git_bash()}")
+        except RuntimeError as e:
+            line(False, str(e))
     line(repo_root() is not None, "inside a git repository" if repo_root() else "not in a git repository (implementers need one)")
     snap = claude_snapshot()
     line(snap is not None, "Claude statusline snapshot found" if snap else "no Claude statusline snapshot yet; run `orc setup`, then restart Claude Code")
@@ -1968,6 +2034,9 @@ def cmd_doctor(a) -> int:
 
 
 def main(argv=None) -> int:
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles and pipes default to a legacy code page
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(prog="orc", description="Run Codex workers for a Claude Code lead.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("check", help="validate a plan and print it as a table (no Codex calls)")
