@@ -106,3 +106,30 @@ Everything is tested against a fake `codex` (`tests/fake_codex.py`), because Cod
 - A PreToolUse hook that blocks the Agent tool when Codex quota is available, if the lead over-uses Claude subagents.
 - Best-of-N implementers with a judge, for hard, well-tested problems.
 - Optionally pair with `openai/codex-plugin-cc` for `/codex:adversarial-review` on non-orc work.
+- **Research sources via MCP** (not built yet). Give research workers primary sources beyond Codex's built-in web search. Details are below.
+
+### Option: MCP research sources
+
+Codex can attach MCP servers for a single run with `-c mcp_servers.<name>.…`. orc would read a small `sources.toml` and attach the servers only to `ask --research`, `ask --web` and plan tasks marked `web = true`. Implementers and verifiers would not get them, so they don't pay for extra tool definitions.
+
+Candidate sources:
+
+| Source | What it adds | Cost |
+|---|---|---|
+| Context7 | Current, version-specific library and framework docs | Free tier, hosted |
+| GitHub MCP (read-only tools only) | Source, issues, releases and changelogs: primary sources for "what changed / is this a known bug" | Free; needs a GitHub token |
+| arXiv MCP | Paper search and full text | Free |
+| Exa, Brave or Tavily (optional) | Better search results than the built-in search | Free tier, then paid |
+
+Rules to follow if this is built:
+
+- **Pre-approve each server.** Set `default_tools_approval_mode = "approve"` for each one. Otherwise non-interactive `codex exec` silently refuses every MCP call under approval policy `never`. The worker can't tell a refusal from a dead server, so it answers without evidence. See [devstandard#358](https://github.com/LeonJoeeee/devstandard/issues/358) and [codex#31565](https://github.com/openai/codex/issues/31565).
+- **Restrict tools.** Give every server an explicit `enabled_tools` allow-list, so GitHub's write tools are never exposed. Read tokens from environment variables.
+- **Tell the worker which source to use.** Extend `prompts/research.md`:
+  - library or API behavior → Context7 first
+  - bugs and changes → GitHub
+  - methods and evidence → arXiv
+  - everything else → web search
+  - quote the source for key claims
+- **Report source use.** Count the `mcp_tool_call` events in the summary (e.g. `sources: context7 ×3, github ×2, web ×5`) and flag refused calls, so the lead can see thin evidence.
+- **Check the servers.** Have `orc doctor` start each configured source and confirm it responds. It also needs to confirm that MCP servers have network access while the worker runs `-s read-only`.
