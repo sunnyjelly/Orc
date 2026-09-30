@@ -1,5 +1,6 @@
 """End-to-end tests for bin/orc against tests/fake_codex.py. Run: python3 -m unittest discover tests"""
 import json
+import copy
 import os
 import re
 import runpy
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -669,6 +671,679 @@ class OrcTest(unittest.TestCase):
                 prompt="q", logdir=self.tmp / "usage", name="usage", schema="worker-result", slots=ObservedSlot())
         self.assertIsNone(rec["error"])
         self.assertEqual(snapshots, [True])
+
+    # ---- follow-ups and history ----------------------------------------------------------------
+
+    def asks(self):
+        return [json.loads(l) for l in (self.repo / ".orc" / "asks" / "asks.jsonl").read_text().splitlines()]
+
+    def test_ask_follow_up_resumes_the_same_thread(self):
+        self.orc("statusline", stdin=json.dumps({"session_id": "s3", "workspace": {"project_dir": str(self.repo)}}))
+        p = self.orc("ask", "--model", "luna", "--effort", "xhigh", "first question?")
+        first = re.search(r"· ask (\S+)$", p.stdout.strip()).group(1)                 # the footer names the ask
+        self.assertIn("resume=None", p.stdout)
+        p = self.orc("ask", "--continue", first, "and a follow-up?")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        asks = self.asks()
+        self.assertEqual(asks[1]["thread"], asks[0]["thread"])                          # same Codex thread
+        self.assertIn(f"resume={asks[0]['thread']}", p.stdout)
+        self.assertIn("model=gpt-6-luna effort=xhigh", p.stdout)                        # keeps the thread's model and effort
+        self.assertIn(f"(follow-up to {first})", p.stdout)
+        self.assertEqual((asks[1]["parent"], asks[1]["root"]), (first, first))
+        prompt = (self.repo / ".orc" / "asks" / f"{asks[1]['id']}.prompt.md").read_text()
+        self.assertTrue(prompt.startswith("## Follow-up question\nand a follow-up?"))  # no repeated preamble
+        p = self.orc("ask", "--continue", "last", "--model", "sol", "third?")        # `last`; explicit flags still win
+        asks = self.asks()
+        self.assertEqual((asks[2]["parent"], asks[2]["root"], asks[2]["thread"]), (asks[1]["id"], first, asks[0]["thread"]))
+        self.assertIn("model=gpt-6.1-sol effort=xhigh", p.stdout)
+        p = self.orc("ask", "--research", "what changed in X?")
+        research = self.asks()[-1]["id"]
+        p = self.orc("ask", "--continue", research, "dig into Y")
+        self.assertIn("- fake research finding", p.stdout)                              # research follow-ups stay reports
+        self.assertIn("Full report:", p.stdout)
+        self.assertNotIn("long details", p.stdout)
+        p = self.orc("ask", "--continue", "nope", "q")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no ask or run task 'nope'", p.stderr)
+        self.assertIn("| research ×2 |", self.orc("report").stdout)
+
+        # history lists a conversation once, with its follow-ups; show replays it
+        p = self.orc("show")
+        self.assertIn(f"{first}  ", p.stdout)
+        self.assertIn("first question?", p.stdout)
+        self.assertIn("(+2 follow-ups)", p.stdout)
+        self.assertNotIn("third?", p.stdout)
+        self.assertIn("(+1 follow-up)", p.stdout)
+        p = self.orc("show", "--grep", "THIRD")                                        # matches a follow-up, lists its root
+        self.assertIn("first question?", p.stdout)
+        self.assertNotIn("what changed", p.stdout)
+        p = self.orc("show", asks[2]["id"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for text in ("first question?", "and a follow-up?", "third?", f"Continue: `orc ask --continue {asks[2]['id']}"):
+            self.assertIn(text, p.stdout)
+        self.assertEqual(p.stdout.count("A: fake answer"), 3)
+
+    def test_ask_a_finished_worker_about_its_work(self):
+        self.plan("q.toml", """
+            goal = "ask a worker"
+            checks = ["true"]
+            [[task]]
+            id = "impl-a"
+            role = "implementer"
+            why = "w"
+            brief = "b"
+            acceptance = ["ok"]
+            verify = "checks"
+        """)
+        self.assertEqual(self.orc("run", "q.toml").returncode, 0)
+        run_id, st = self.state()
+        thread = st["tasks"]["impl-a"]["calls"][0]["thread"]
+        p = self.orc("ask", "--continue", f"{run_id}/impl-a", "why this approach?")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(f"[cwd=impl-a sandbox=read-only resume={thread}]", p.stdout)     # its worktree, read-only
+        prompt = (self.repo / ".orc" / "asks" / f"{self.asks()[-1]['id']}.prompt.md").read_text()
+        self.assertIn("not a new task", prompt)
+        self.assertIn("plain prose, not JSON", prompt)
+        self.orc("merge", run_id)                                                         # worktree removed after merge
+        p = self.orc("ask", "--continue", f"{run_id}/impl-a", "and now?")
+        self.assertIn("[cwd=repo sandbox=read-only", p.stdout)
+        self.assertIn("contains your merged changes", (self.repo / ".orc" / "asks" / f"{self.asks()[-1]['id']}.prompt.md").read_text())
+        p = self.orc("show")
+        self.assertIn(f"→ {run_id}/impl-a", p.stdout)
+        self.assertIn("impl-a checks-passed (merged)", p.stdout)
+        p = self.orc("show", f"{run_id}/impl-a")
+        self.assertIn(f"thread {thread}", p.stdout)
+        self.assertIn("brief: b", p.stdout)
+        self.assertIn(f'`continues = "{run_id}/impl-a"`', p.stdout)
+        p = self.orc("show", run_id)
+        self.assertIn("✓ impl-a", p.stdout)
+        self.assertIn(f"orc show {run_id}/<task>", p.stdout)
+        self.assertIn(f"Questions to {run_id}/impl-a", self.orc("show", self.asks()[-1]["id"]).stdout)
+
+    FOLLOW = """
+        goal = "follow-up work"
+        checks = ["true"]
+        [[task]]
+        id = "more"
+        role = "implementer"
+        continues = "{ref}"
+        why = "w"
+        brief = "extend it"
+        acceptance = ["ok"]
+        verify = "checks"
+    """
+
+    def test_new_plan_continues_a_merged_workers_thread(self):
+        self.plan("a.toml", """
+            goal = "first"
+            checks = ["true"]
+            [[task]]
+            id = "impl-a"
+            role = "implementer"
+            why = "w"
+            brief = "b"
+            acceptance = ["ok"]
+            verify = "checks"
+        """)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, st = self.state()
+        thread = st["tasks"]["impl-a"]["calls"][0]["thread"]
+        self.assertEqual(self.orc("merge", run_a).returncode, 0)
+        p = self.orc("steer", run_a, "impl-a", "more")
+        self.assertIn(f'continues = "{run_a}/impl-a"', p.stderr)                          # steer points to the new route
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        p = self.orc("check", "b.toml")
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn(f"· ↻ {run_a}/impl-a |", p.stdout)
+        p = self.orc("run", "b.toml")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        run_b, st = self.state()
+        more = st["tasks"]["more"]
+        self.assertEqual(more["calls"][0]["thread"], thread)                               # warm thread, resumed
+        self.assertEqual(more["continues"], f"{run_a}/impl-a")
+        self.assertTrue((Path(more["worktree"]) / "impl-a.txt").exists())                  # fresh worktree from HEAD
+        self.assertTrue(more["worktree"].endswith("/more"))
+        prompt = (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text()
+        self.assertTrue(prompt.startswith(f"## Follow-up to your earlier work ({run_a}/impl-a)"))
+        self.assertIn("are already in this checkout", prompt)
+        self.assertIn("## Your task: more\nextend it", prompt)
+        self.assertEqual(self.orc("merge", run_b).returncode, 0)
+        self.assertTrue((self.repo / "more.txt").exists())
+
+    ONE = """
+        goal = "first"
+        checks = ["true"]
+        [[task]]
+        id = "impl-a"
+        role = "implementer"
+        why = "w"
+        brief = "b"
+        acceptance = ["ok"]
+        verify = "checks"
+    """
+
+    def test_continues_unmerged_work_and_rejects_bad_refs(self):
+        self.plan("a.toml", self.ONE)
+        self.orc("run", "a.toml")
+        run_a, _ = self.state()
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        p = self.orc("run", "b.toml")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        run_b, st = self.state()
+        prompt = (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text()
+        self.assertIn(f"NOT in this checkout (they are on orc/{run_a}/impl-a", prompt)
+        for ref, err in ((f"{run_b}/nope", "no task nope"), ("20990101-000000/x", "no run 20990101-000000"),
+                         ("last", "`continues` must be"), ("0101-000000-000", "`continues` must be"), ("bad ref!", "`continues` must be")):
+            self.plan("c.toml", self.FOLLOW.replace("{ref}", ref))
+            p = self.orc("check", "c.toml")
+            self.assertEqual(p.returncode, 1, ref)
+            self.assertIn(err, p.stdout)
+        self.plan("d.toml", self.FOLLOW.replace("{ref}", f"{run_b}/more") + """
+            [[task]]
+            id = "again"
+            role = "explorer"
+            continues = "REF"
+            why = "w"
+            brief = "b"
+        """.replace("REF", f"{run_b}/more"))
+        p = self.orc("check", "d.toml")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("continue the same Codex thread", p.stdout)
+
+    def test_check_creates_nothing(self):
+        self.plan("c.toml", self.FOLLOW.replace("{ref}", "20990101-000000/x"))
+        self.assertEqual(self.orc("check", "c.toml").returncode, 1)
+        self.assertFalse((self.repo / ".orc").exists())
+
+    def test_web_threads_never_resume_with_write_access(self):
+        self.plan("a.toml", """
+            goal = "web"
+            checks = ["true"]
+            [[task]]
+            id = "web-x"
+            role = "explorer"
+            web = true
+            why = "w"
+            brief = "search"
+            [[task]]
+            id = "impl-a"
+            role = "implementer"
+            why = "w"
+            brief = "b"
+            acceptance = ["ok"]
+            verify = "checks"
+        """)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, st = self.state()
+        for flag in ("--web", "--research"):                                             # no web pages into a worker's thread
+            p = self.orc("ask", "--continue", f"{run_a}/impl-a", flag, "q")
+            self.assertEqual(p.returncode, 1)
+            self.assertIn("can't use --web or --research", p.stderr)
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/web-x").replace('role = "implementer"', 'role = "explorer"'))
+        self.assertEqual(self.orc("run", "b.toml").returncode, 0)                          # a reader may continue it...
+        run_b, _ = self.state()
+        self.plan("c.toml", self.FOLLOW.replace("{ref}", f"{run_b}/more"))
+        p = self.orc("check", "c.toml")                                                   # ...but can't launder it to a writer
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("can't continue a thread that used web search", p.stdout)
+        # a thread tainted any other way (e.g. by an older orc) is refused for steer and continues
+        thread = st["tasks"]["impl-a"]["calls"][0]["thread"]
+        (self.repo / ".orc" / "asks").mkdir(exist_ok=True)
+        with open(self.repo / ".orc" / "asks" / "asks.jsonl", "a") as f:
+            f.write(json.dumps({"id": "0101-000000-000", "thread": thread, "web": True}) + "\n")
+        p = self.orc("steer", run_a, "impl-a", "more")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("has seen web search results", p.stderr)
+        self.plan("d.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        self.assertIn("used web search", self.orc("check", "d.toml").stdout)
+
+    def test_a_continued_thread_moves_to_its_new_task(self):
+        self.plan("a.toml", self.ONE)
+        self.orc("run", "a.toml")
+        run_a, st = self.state()
+        thread = st["tasks"]["impl-a"]["calls"][0]["thread"]
+        self.plan("b.toml", """
+            goal = "gate, then continue"
+            checks = ["! grep -rq BROKEN --include=*.txt ."]
+            [[task]]
+            id = "gate"
+            role = "implementer"
+            why = "w"
+            brief = "FAKE_BREAK_UNTIL_STEER"
+            acceptance = ["ok"]
+            verify = "checks"
+            [[task]]
+            id = "more"
+            role = "implementer"
+            after = ["gate"]
+            continues = "REF"
+            why = "w"
+            brief = "extend it"
+            acceptance = ["ok"]
+            verify = "checks"
+        """.replace("REF", f"{run_a}/impl-a"))
+        self.assertEqual(self.orc("run", "b.toml").returncode, 2)
+        run_b, st = self.state()
+        self.assertEqual((st["tasks"]["gate"]["status"], st["tasks"]["more"]["status"]), ("failed", "skipped"))
+        self.orc("steer", run_b, "gate", "STEER_FIX")
+        p = self.orc("resume", run_b)                                                     # the skipped task keeps its thread
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        _, st = self.state()
+        self.assertEqual(st["tasks"]["more"]["calls"][0]["thread"], thread)
+        self.assertTrue((Path(st["tasks"]["more"]["worktree"]) / "gate.txt").exists())
+        self.assertIn("## Follow-up to your earlier work", (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text())
+        # continue again; the continued call fails its check, repairs on the same thread, then steers
+        self.plan("c.toml", self.FOLLOW.replace("{ref}", f"{run_b}/more").replace("extend it", "FAKE_BREAK_UNTIL_STEER")
+                  .replace('checks = ["true"]', 'checks = ["! grep -rq BROKEN --include=*.txt ."]'))
+        self.assertEqual(self.orc("run", "c.toml").returncode, 2)
+        run_c, st = self.state()
+        self.assertEqual([c["name"] for c in st["tasks"]["more"]["calls"]], ["worker", "repair1"])
+        self.assertEqual(self.orc("steer", run_c, "more", "STEER_FIX").returncode, 0)
+        _, st = self.state()
+        self.assertEqual({c["thread"] for c in st["tasks"]["more"]["calls"]}, {thread})
+        self.assertEqual(st["tasks"]["more"]["status"], "checks-passed")
+        # only the newest task may resume the thread now
+        for args in (("steer", run_a, "impl-a", "x"), ("steer", run_b, "more", "x"), ("ask", "--continue", f"{run_a}/impl-a", "q")):
+            p = self.orc(*args)
+            self.assertEqual(p.returncode, 1, args)
+            self.assertIn(f"continued by {run_c}/more", p.stderr)
+        self.plan("d.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        self.assertIn(f"continued by {run_c}/more; use {run_c}/more instead", self.orc("check", "d.toml").stdout)
+        self.assertIn(f"Its thread was continued by {run_c}/more", self.orc("show", f"{run_a}/impl-a").stdout)
+
+    def test_worker_questions_follow_the_worker(self):
+        self.plan("a.toml", self.ONE)
+        self.orc("run", "a.toml")
+        run_a, _ = self.state()
+        self.orc("ask", "--continue", f"{run_a}/impl-a", "first?")
+        first = self.asks()[-1]["id"]
+        p = self.orc("ask", "--continue", "last", "second?")                              # still a question to the worker
+        self.assertIn("[cwd=impl-a sandbox=read-only", p.stdout)
+        x = self.asks()[-1]
+        self.assertEqual((x["parent"], x["root"]), (first, f"{run_a}/impl-a"))
+        prompt = (self.repo / ".orc" / "asks" / f"{x['id']}.prompt.md").read_text()
+        self.assertIn(f"your work on `{run_a}/impl-a`, not a new task", prompt)
+        self.assertEqual(self.orc("ask", "--continue", first, "--web", "q").returncode, 1)
+        self.orc("clean", run_a)
+        p = self.orc("ask", "--continue", f"{run_a}/impl-a", "third?")
+        self.assertIn("[cwd=repo", p.stdout)
+        self.assertIn("your worktree was removed and your changes are not in it",
+                      (self.repo / ".orc" / "asks" / f"{self.asks()[-1]['id']}.prompt.md").read_text())
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        self.assertEqual(self.orc("run", "b.toml").returncode, 0)
+        run_b, _ = self.state()
+        self.assertIn("NOT in this checkout (their branch was removed)",
+                      (self.repo / ".orc" / "runs" / run_b / "more" / "worker.prompt.md").read_text())
+        p = self.orc("show")                                                              # one conversation per worker
+        self.assertEqual(p.stdout.count(f"→ {run_a}/impl-a"), 1)
+        self.assertIn("first?", p.stdout)
+        self.assertIn("(+2 follow-ups)", p.stdout)
+        p = self.orc("show", "-n", "1")
+        self.assertIn(f"{run_b}  ", p.stdout)
+        self.assertIn("… 1 older runs (use -n)", p.stdout)
+        p = self.orc("show", "--grep", "extend it")                                       # searches plans too
+        self.assertIn(run_b, p.stdout)
+        self.assertNotIn(f"{run_a}  ", p.stdout)
+        self.assertNotIn("first?", p.stdout)
+        p = self.orc("show", first)                                                       # earlier answers are clipped
+        self.assertIn("A: fake answer", p.stdout)
+
+    def test_last_is_per_session_and_bad_files_do_not_crash(self):
+        status = lambda sid: json.dumps({"session_id": sid, "workspace": {"project_dir": str(self.repo)}})
+        self.orc("statusline", stdin=status("one"))
+        self.orc("ask", "q")
+        self.orc("statusline", stdin=status("two"))
+        p = self.orc("ask", "--continue", "last", "q2")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no earlier ask in this Claude session", p.stderr)
+        with open(self.repo / ".orc" / "asks" / "asks.jsonl", "a") as f:
+            f.write('"junk"\n[1]\nnot json\n')
+        self.plan("a.toml", self.ONE)
+        self.orc("run", "a.toml")
+        run_a, _ = self.state()
+        (self.repo / ".orc" / "runs" / run_a / "plan.toml").unlink()
+        bad = self.repo / ".orc" / "runs" / "20200101-000000"
+        bad.mkdir()
+        (bad / "state.json").write_text("[]")
+        p = self.orc("show")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn(run_a, p.stdout)
+        self.assertIn("sol high  q\n", p.stdout)
+        self.assertEqual(self.orc("show", f"{run_a}/impl-a").returncode, 0)
+        for ref in ("20200101-000000", "20200101-000000/x", "nope"):
+            p = self.orc("show", ref)
+            self.assertEqual(p.returncode, 1, ref)
+            self.assertNotIn("Traceback", p.stderr)
+
+
+    def test_a_planned_continues_claims_the_thread_before_it_runs(self):
+        self.plan("s.toml", """
+            goal = "scout"
+            [[task]]
+            id = "s"
+            role = "explorer"
+            why = "w"
+            brief = "look"
+        """)
+        self.orc("run", "s.toml")
+        run0, st = self.state()
+        thread = st["tasks"]["s"]["calls"][0]["thread"]
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run0}/s") + """
+            [[task]]
+            id = "x"
+            role = "explorer"
+            why = "w"
+            brief = "other"
+        """)
+        self.assertEqual(self.orc("run", "b.toml", "--only", "x").returncode, 0)          # `more` hasn't run, but holds the thread
+        run_b, st = self.state()
+        self.assertNotIn("more", st["tasks"])
+        self.plan("a.toml", self.FOLLOW.replace("{ref}", f"{run0}/s").replace('role = "implementer"', 'role = "explorer"\nweb = true'))
+        p = self.orc("check", "a.toml")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn(f"continued by {run_b}/more", p.stdout)
+        self.assertIn(f"continued by {run_b}/more", self.orc("ask", "--continue", f"{run0}/s", "q").stderr)
+        p = self.orc("resume", run_b)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        _, st = self.state()
+        self.assertEqual(st["tasks"]["more"]["calls"][0]["thread"], thread)
+        self.assertEqual(self.orc("steer", run_b, "more", "again").returncode, 0)          # the claimant owns it
+        # a claim on a web plan entry taints the thread even before it runs; so does an unreadable plan
+        self.plan("w.toml", self.FOLLOW.replace("{ref}", f"{run_b}/more").replace('role = "implementer"', 'role = "explorer"\nweb = true')
+                  + '\n[[task]]\nid = "x"\nrole = "explorer"\nwhy = "w"\nbrief = "other"\n')
+        self.assertEqual(self.orc("run", "w.toml", "--only", "x").returncode, 0)
+        run_w, _ = self.state()
+        self.plan("i.toml", self.FOLLOW.replace("{ref}", f"{run_w}/more"))
+        self.assertIn("used web search", self.orc("check", "i.toml").stdout)
+        (self.repo / ".orc" / "runs" / run_w / "plan.toml").write_text("not toml [")
+        self.assertIn("used web search", self.orc("check", "i.toml").stdout)
+
+    def test_web_is_recorded_in_state_and_survives_a_lost_plan(self):
+        self.plan("a.toml", """
+            goal = "web"
+            [[task]]
+            id = "e"
+            role = "explorer"
+            web = true
+            why = "w"
+            brief = "search"
+        """)
+        self.orc("run", "a.toml")
+        run_a, st = self.state()
+        self.assertTrue(st["tasks"]["e"]["web"])
+        (self.repo / ".orc" / "runs" / run_a / "plan.toml").unlink()
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/e"))
+        self.assertIn("used web search", self.orc("check", "b.toml").stdout)
+        p = self.orc("ask", "--continue", f"{run_a}/e", "what did you find?")            # questions never search the web
+        self.assertIn("web=False", p.stdout)
+
+    def test_a_running_task_cannot_be_resumed_elsewhere(self):
+        self.plan("a.toml", self.ONE)
+        self.orc("run", "a.toml")
+        run_a, st = self.state()
+        path = self.repo / ".orc" / "runs" / run_a / "state.json"
+        st["tasks"]["impl-a"].update(status="running", pid=os.getpid())                  # a live orc process holds it
+        path.write_text(json.dumps(st))
+        for args in (("ask", "--continue", f"{run_a}/impl-a", "q"), ("steer", run_a, "impl-a", "x")):
+            p = self.orc(*args)
+            self.assertEqual(p.returncode, 1, args)
+            self.assertIn("is running right now", p.stderr)
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        self.assertIn("is running right now", self.orc("check", "b.toml").stdout)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        st["tasks"]["impl-a"]["pid"] = dead.pid                                          # its process died: usable again
+        path.write_text(json.dumps(st))
+        self.assertEqual(self.orc("ask", "--continue", f"{run_a}/impl-a", "q").returncode, 0)
+
+    def test_malformed_runs_do_not_break_other_commands(self):
+        self.plan("a.toml", self.ONE)
+        self.orc("run", "a.toml")
+        run_a, _ = self.state()
+        runs = self.repo / ".orc" / "runs"
+        for name, state in (("20200101-000001", {"tasks": []}), ("20200101-000002", {"tasks": {"t": {"calls": None}}}),
+                            ("20200101-000003", {"tasks": {"t": {"calls": [1, {"thread": "x"}, {"name": None, "thread": "y"}]}}}),
+                            ("20200101-000004", {"tasks": {"t": "junk"}, "continues": ["x"]})):
+            (runs / name).mkdir()
+            (runs / name / "state.json").write_text(json.dumps(state))
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        for args in (("check", "b.toml"), ("show",), ("show", f"{run_a}/impl-a"), ("ask", "--continue", f"{run_a}/impl-a", "q"),
+                     ("steer", run_a, "impl-a", "again")):
+            p = self.orc(*args)
+            self.assertEqual(p.returncode, 0, (args, p.stdout, p.stderr))
+
+    def test_same_second_runs_sort_numerically(self):
+        runs = self.repo / ".orc" / "runs"
+        for name in ("20260930-101010", "20260930-101010-2", "20260930-101010-10"):
+            (runs / name).mkdir(parents=True)
+            (runs / name / "state.json").write_text(json.dumps({"id": name, "goal": f"goal {name}", "order": [], "tasks": {}}))
+        out = self.orc("show").stdout
+        self.assertLess(out.index("goal 20260930-101010-10"), out.index("goal 20260930-101010-2"))
+        self.assertIn("run 20260930-101010-10 ", self.orc("resume").stderr)                 # the latest run
+
+    def wait_file(self, path, process):
+        deadline = time.monotonic() + 5
+        while not path.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(path.exists(), f"process did not reach {path}; exit={process.poll()}")
+
+    def test_concurrent_continuations_publish_only_one_claim(self):
+        self.plan("a.toml", self.ONE)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, _ = self.state()
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a"))
+        # Widen precisely the validation/persistence gap in separate orc processes.
+        driver = self.tmp / "claim.py"
+        driver.write_text(textwrap.dedent(f'''
+            import runpy, sys, time
+            from pathlib import Path
+            from types import SimpleNamespace
+            mod = runpy.run_path({ORC[1]!r}, run_name="claim_test")
+            original = mod["resolve_continues"]
+            def slow_resolve(*args):
+                result = original(*args)
+                time.sleep(0.25)
+                return result
+            mod["cmd_run"].__globals__["resolve_continues"] = slow_resolve
+            mod["Run"].execute = lambda *args: None
+            Path(sys.argv[1]).touch()
+            deadline = time.monotonic() + 5
+            while not Path(sys.argv[2]).exists():
+                if time.monotonic() > deadline:
+                    raise RuntimeError("test did not start claimants")
+                time.sleep(0.01)
+            sys.exit(mod["cmd_run"](SimpleNamespace(plan="b.toml", only=None)))
+        '''))
+        go = self.tmp / "go"
+        processes = [subprocess.Popen([sys.executable, str(driver), str(self.tmp / f"ready{i}"), str(go)],
+                        cwd=self.repo, env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                     for i in range(2)]
+        try:
+            for i, process in enumerate(processes):
+                self.wait_file(self.tmp / f"ready{i}", process)
+            go.touch()
+            outputs = [p.communicate(timeout=10) for p in processes]
+            self.assertEqual(sorted(p.returncode for p in processes), [0, 1], outputs)
+            self.assertIn("continued by", "".join(out + err for out, err in outputs))
+            states = [json.loads(p.read_text()) for p in (self.repo / ".orc" / "runs").glob("*/state.json")]
+            self.assertEqual(sum(bool(st.get("continues")) for st in states), 1)
+        finally:
+            for p in processes:
+                if p.poll() is None:
+                    p.kill()
+                p.communicate(timeout=5)
+
+    def test_resume_refuses_transferred_threads_for_writers_and_readers(self):
+        self.plan("a.toml", self.ONE)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        source, st = self.state()
+        for role in ("implementer", "explorer"):
+            with self.subTest(role=role):
+                follow = self.FOLLOW.replace('role = "implementer"', f'role = "{role}"')
+                self.plan("b.toml", follow.replace("{ref}", f"{source}/impl-a") +
+                          '\n[[task]]\nid="x"\nrole="explorer"\nwhy="w"\nbrief="other"\n')
+                self.assertEqual(self.orc("run", "b.toml", "--only", "x").returncode, 0)
+                run_b, _ = self.state()
+                # B is filtered out but owns the claim; C transfers it before B's recovery.
+                self.plan("c.toml", self.FOLLOW.replace("{ref}", f"{run_b}/more"))
+                self.assertEqual(self.orc("run", "c.toml").returncode, 0)
+                run_c, _ = self.state()
+                before = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text())["calls"]
+                p = self.orc("resume", run_b)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn(f"continued by {run_c}/more", p.stdout)
+                disk = json.loads((self.repo / ".orc" / "runs" / run_b / "state.json").read_text())
+                self.assertEqual(disk["tasks"]["more"]["calls"], [])
+                after = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text())["calls"]
+                self.assertEqual(before, after)
+                # Use a new independent thread for the next role.
+                self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+                source, _ = self.state()
+
+    def test_active_worker_question_reserves_thread_and_releases_on_failure(self):
+        self.plan("a.toml", self.ONE)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, _ = self.state()
+        ref = f"{run_a}/impl-a"
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", ref))
+        gate = self.tmp / "question"
+        env = dict(self.env, ORC_FAKE_GATE=str(gate))
+        process = subprocess.Popen(ORC + ["ask", "--continue", ref, "FAKE_HOLD why?"], cwd=self.repo,
+                                   env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.wait_file(gate.with_suffix(".ready"), process)
+            for args in (("ask", "--continue", ref, "q"), ("steer", run_a, "impl-a", "q"),
+                         ("check", "b.toml"), ("run", "b.toml")):
+                p = self.orc(*args)
+                self.assertEqual(p.returncode, 1, (args, p.stdout, p.stderr))
+                self.assertIn("is running right now", p.stdout + p.stderr)
+            # The next reserved question will fail to launch Codex.
+            self.env["ORC_CODEX_BIN"] = str(self.tmp / "missing-codex")
+        finally:
+            gate.with_suffix(".release").touch()
+            out, err = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, out + err)
+        self.assertEqual(self.orc("ask", "--continue", ref, "q").returncode, 1)
+        self.env["ORC_CODEX_BIN"] = str(ROOT / "tests" / "fake_codex.py")
+        self.assertEqual(self.orc("ask", "--continue", ref, "q").returncode, 0)
+        self.assertEqual(self.orc("run", "b.toml").returncode, 0)
+
+    def test_active_ask_conversation_reserves_thread(self):
+        self.assertEqual(self.orc("ask", "q").returncode, 0)
+        ref = self.asks()[-1]["id"]
+        gate = self.tmp / "conversation"
+        process = subprocess.Popen(ORC + ["ask", "--continue", ref, "FAKE_HOLD q"], cwd=self.repo,
+                                   env=dict(self.env, ORC_FAKE_GATE=str(gate)), text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.wait_file(gate.with_suffix(".ready"), process)
+            p = self.orc("ask", "--continue", ref, "q2")
+            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+            self.assertIn("is running right now", p.stderr)
+        finally:
+            gate.with_suffix(".release").touch()
+            out, err = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, out + err)
+        self.assertEqual(self.orc("ask", "--continue", ref, "q3").returncode, 0)
+
+    def test_resume_waits_for_question_on_a_skipped_claimant(self):
+        self.plan("a.toml", self.ONE)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, _ = self.state()
+        self.plan("b.toml", self.FOLLOW.replace("{ref}", f"{run_a}/impl-a") +
+                  '\n[[task]]\nid="x"\nrole="explorer"\nwhy="w"\nbrief="other"\n')
+        self.assertEqual(self.orc("run", "b.toml", "--only", "x").returncode, 0)
+        run_b, _ = self.state()
+        gate = self.tmp / "recovery"
+        process = subprocess.Popen(ORC + ["ask", "--continue", f"{run_b}/more", "FAKE_HOLD q"],
+                                   cwd=self.repo, env=dict(self.env, ORC_FAKE_GATE=str(gate)), text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.wait_file(gate.with_suffix(".ready"), process)
+            p = self.orc("resume", run_b)
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            self.assertIn("is running right now", p.stdout)
+            _, st = self.state()
+            self.assertEqual(st["tasks"]["more"]["status"], "skipped")
+            self.assertEqual(st["tasks"]["more"]["calls"], [])
+        finally:
+            gate.with_suffix(".release").touch()
+            out, err = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, out + err)
+        p = self.orc("resume", run_b)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_search_disabled_overrides_inherited_config_on_resumed_threads(self):
+        config = Path(self.env["CODEX_HOME"]) / "config.toml"
+        for mode in ("cached", "live"):
+            with self.subTest(mode=mode):
+                config.write_text(f'web_search = "{mode}"\n')
+                self.plan("a.toml", self.ONE)
+                self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+                run_a, _ = self.state()
+                p = self.orc("ask", "--continue", f"{run_a}/impl-a", "q")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn("web=False", p.stdout)
+                self.assertEqual(self.orc("ask", "--continue", "last", "q2").returncode, 0)
+                state = json.loads((Path(self.env["CODEX_HOME"]) / "fake-state.json").read_text())
+                for call in state["invocations"][-3:]:
+                    self.assertEqual(call["web_search"], "disabled", call)
+                self.assertIsNotNone(state["invocations"][-1]["resume"])
+        self.assertIn("web=True", self.orc("ask", "--web", "q").stdout)
+
+    def test_reader_followup_preserves_dependency_checkout_and_old_state(self):
+        self.plan("a.toml", self.ONE + '\n[[task]]\nid="review"\nrole="reviewer"\nafter=["impl-a"]\nwhy="w"\nbrief="review"\n')
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, st = self.state()
+        cwd = st["tasks"]["impl-a"]["worktree"]
+        self.assertEqual(st["tasks"]["review"]["cwd"], cwd)
+        for legacy in (False, True):
+            if legacy:
+                del st["tasks"]["review"]["cwd"]
+                (self.repo / ".orc" / "runs" / run_a / "state.json").write_text(json.dumps(st))
+            p = self.orc("ask", "--continue", f"{run_a}/review", "q")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("[cwd=impl-a sandbox=read-only", p.stdout)
+        self.assertEqual(self.orc("clean", run_a).returncode, 0)
+        self.assertIn("[cwd=repo sandbox=read-only", self.orc("ask", "--continue", f"{run_a}/review", "q").stdout)
+
+    def test_show_rejects_malformed_selected_records_and_skips_unrelated_records(self):
+        self.plan("a.toml", self.ONE)
+        self.assertEqual(self.orc("run", "a.toml").returncode, 0)
+        run_a, original = self.state()
+        path = self.repo / ".orc" / "runs" / run_a / "state.json"
+        mutations = [("tasks", ["junk"]), ("calls", ["junk"]), ("calls", [{"usage": [1]}]),
+                     ("calls", [{"name": None}]), ("calls", [{"cost": "junk"}]), ("result", [1]),
+                     ("result", {"findings": "junk"}), ("checks", [{"exit": 1, "tail": [1]}]),
+                     ("verdicts", [{"issues": ["junk"]}])]
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                st = copy.deepcopy(original)
+                if key == "tasks":
+                    st[key] = value
+                else:
+                    st["tasks"]["impl-a"][key] = value
+                path.write_text(json.dumps(st))
+                p = self.orc("show", f"{run_a}/impl-a")
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn("unreadable", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                for args in (("show",), ("show", run_a)):
+                    p = self.orc(*args)
+                    self.assertIn(p.returncode, (0, 1))
+                    self.assertNotIn("Traceback", p.stderr)
+        original["tasks"]["bad"] = {"id": "bad", "status": "done", "calls": [1]}
+        original["order"].append("bad")
+        path.write_text(json.dumps(original))
+        for args in (("show",), ("show", run_a), ("show", f"{run_a}/impl-a")):
+            p = self.orc(*args)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("impl-a", p.stdout)
+        asks = self.repo / ".orc" / "asks"
+        asks.mkdir(exist_ok=True)
+        with open(asks / "asks.jsonl", "a") as f:
+            f.write(json.dumps({"id": "bad", "root": [], "question": [1]}) + "\n")
+        self.assertEqual(self.orc("show").returncode, 0)
 
 
 class PackagingTest(unittest.TestCase):

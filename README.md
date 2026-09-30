@@ -86,9 +86,12 @@ Open any git repo in Claude Code and ask for work as usual. Set the model to Opu
 | Command | What it does |
 |---|---|
 | `orc ask [--model sol\|luna] [--effort E] [--web] [--research] "Q"` | Quick read-only consult (default GPT-6.1 Sol at high effort): a second opinion, lookup, or web research. `--research` saves a cited report to `.orc/asks/` and prints only its summary. |
+| `orc ask --continue ID\|last\|RUN/TASK "Q"` | Follow-up in an earlier thread: continues an ask conversation (same model and mode), or asks a finished worker about its work, read-only. Each ask's footer prints its id. |
+| `orc show [--grep TEXT] [-n N]` | Lists earlier runs (with task statuses) and ask conversations, newest first. |
+| `orc show RUN\|RUN/TASK\|ASK-ID` | Re-reads a run summary, a task's full result and thread id, or a whole ask conversation. |
 | `orc check PLAN` | Validates the plan (roles, acceptance criteria, file ownership, cycles) and prints the plan table, estimated Codex calls and current limits. No Codex calls. |
 | `orc run PLAN [--only a,b]` | Runs the plan. Prints progress to stderr and a compact summary to stdout. Exit 0 if everything passed, 2 otherwise. |
-| `orc steer RUN TASK "msg"` | Follow-up on a task's own Codex thread (warm context), then re-check and re-verify. |
+| `orc steer RUN TASK "msg"` | Follow-up on a task's own Codex thread (warm context), then re-check and re-verify. For more work after a task is merged, use `continues = "RUN/TASK"` on a task in a new plan instead. |
 | `orc merge [RUN] [TASK…]` | Merges verified branches (`--no-ff`) and removes clean worktrees once dependents no longer need them. Refuses stale dependencies or an existing Git operation; exits 1 at the first conflict. |
 | `orc clean [RUN]` | Removes a run's leftover worktrees and branches. |
 | `orc report [RUN…] [--all]` | Tokens, ≈ API cost and limit % for this Claude session's runs plus the session itself. |
