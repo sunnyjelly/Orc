@@ -1,0 +1,43 @@
+# USD per 1M tokens. Used only to compute "API-equivalent" cost: with a
+# ChatGPT / Claude subscription you do not pay these prices, but the report
+# shows what the same tokens would cost on the API.
+# Check the provider price pages when models change; unknown models cost as `default`.
+
+[openai.default]
+input = 2.00
+cached_input = 0.10
+output = 10.00
+
+# GPT-6.1 Sol, released 2026-09-29. Requests above 272k input tokens are billed at
+# $4 / $0.20 / $15; orc only sees per-turn totals, so it applies the base rate.
+[openai."gpt-6.1-sol"]
+input = 2.00
+cached_input = 0.10
+output = 10.00
+
+# GPT-6 Luna, released 2026-09-22: OpenAI's cheap, fast tier ($0.10 / $0.50).
+# The cached-input price is not confirmed; assumed to be 10% of input.
+[openai."gpt-6-luna"]
+input = 0.10
+cached_input = 0.01
+output = 0.50
+
+# Only a fallback: the Claude side normally uses the statusline's
+# cost.total_cost_usd, which Claude Code computes at list price.
+[anthropic.default]
+input = 4.00
+output = 20.00
+cache_read = 0.20
+cache_write = 5.00   # 5-minute cache writes (1.25x input); 1-hour writes are 2x
+
+[anthropic."claude-opus-5-5"]
+input = 4.00
+output = 20.00
+cache_read = 0.20
+cache_write = 5.00
+
+[anthropic."claude-sonnet-5-5"]
+input = 2.00
+output = 10.00
+cache_read = 0.20
+cache_write = 2.50

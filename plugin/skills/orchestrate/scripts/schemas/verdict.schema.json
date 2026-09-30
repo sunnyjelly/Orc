@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "orc verifier verdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "criteria", "issues", "summary"],
+  "properties": {
+    "verdict": {"type": "string", "enum": ["pass", "fail", "uncertain"]},
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["criterion", "met", "evidence"],
+        "properties": {
+          "criterion": {"type": "string"},
+          "met": {"type": "string", "enum": ["yes", "no", "unclear"]},
+          "evidence": {"type": "string", "description": "file:line, command + output, or why it could not be checked."}
+        }
+      }
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "location", "problem"],
+        "properties": {
+          "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+          "location": {"type": "string"},
+          "problem": {"type": "string"}
+        }
+      }
+    },
+    "summary": {"type": "string"}
+  }
+}
