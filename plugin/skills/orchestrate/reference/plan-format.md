@@ -61,7 +61,10 @@ How a task runs:
   - `verified`: checks and verifier passed
   - `checks-passed`: `verify = "checks"`
   - `unverified`: no checks and verify none
-  - `failed`
+  - `failed`: checks or verification still fail after the repair rounds
   - `uncertain`: the verifier couldn't decide; the lead decides
-  - `error`
-  - `skipped`: a dependency failed
+  - `blocked`: the worker stopped and asked something (see its open questions); answer with `orc steer`
+  - `error`: Codex failed (missing, timed out, no valid output)
+  - `skipped`: a dependency didn't succeed, or the Codex quota guard stopped it; `orc resume <run>` runs skipped tasks later
+- A read-only task that comes after an implementer (directly or through other read-only tasks) runs in that implementer's worktree, so it sees the new code. An implementer that comes after one branches from its branch.
+- Checks run on your machine, outside Codex's sandbox, on code a worker wrote. Only use `checks` you would run yourself on an untrusted branch.

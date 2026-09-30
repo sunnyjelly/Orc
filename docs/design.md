@@ -12,18 +12,39 @@
 
 ```
 Claude Code (desktop) — Opus 5.5 lead
-  skill: orchestrate (SKILL.md ≈100 lines; 2 reference files loaded on demand)
-  statusLine → `orc statusline` ──► ~/.orc/claude/<session>.json  (cost, limits, transcript path)
+  plugin "orc": skill orchestrate (SKILL.md ≈90 lines; 2 reference files loaded on demand) + skill delegate
+  statusLine → `python3 ~/.orc/app/orc statusline` (installed by `orc setup`) ──► ~/.orc/claude/<session>.json  (cost, limits, transcript path)
   Bash ──► orc check | run (background) | steer | merge | report
                  │
                  ▼
-orc (one stdlib Python file)
+orc (one stdlib Python file, bundled at plugin/skills/orchestrate/scripts/orc)
   plan.toml → validate → DAG scheduler (semaphore = max_parallel Codex processes)
   per task: codex exec (worker) → commit → checks → fresh verifier [→ adversary]
             → on failure: codex exec resume <same thread> with the failures → re-check → new verifier
   writes .orc/runs/<run>/{plan.toml,state.json,summary.md,<task>/*}
   reads ~/.codex/sessions/**/rollout-*-<thread>.jsonl → Codex limit % → ~/.orc/codex-limits.json
 ```
+
+## Packaging
+
+The repo is a Claude Code plugin marketplace: `.claude-plugin/marketplace.json` points to the plugin in `plugin/`.
+- **The plugin** holds two skills:
+  - `orchestrate`: the lead workflow, with orc, its prompts, schemas and pricing inside the skill's `scripts/` folder
+  - `delegate`: portable guidance, with no scripts
+- **How the skill finds orc:** it runs orc as `python3 ${CLAUDE_SKILL_DIR}/scripts/orc …`. Claude Code substitutes the skill's folder, and the skill's `allowed-tools` pre-approves exactly that command. The same skill therefore works as a plugin skill, as an unzipped personal skill, and from a `.skill` file.
+- **The plugin has no `bin/` folder.** claude.ai and Cowork refuse to install plugins that ship executables there, and nothing needs orc on the PATH.
+- **The status line needs a path that survives plugin updates.** The plugin cache path changes with each version, so `orc setup` copies the scripts to `~/.orc/app` and points the status line there. Plugins can't set `statusLine` themselves; plugin settings only take `agent` and `subagentStatusLine`.
+- **`dist/*.skill`** files are deterministic zips of each skill folder, built by `tools/build_skills.py`, and a test checks they match the sources. Skill frontmatter sticks to the six fields claude.ai uploads accept.
+- **Which skill goes where:**
+  - `delegate` is the one to upload to claude.ai. From there it syncs into Claude Code, cloud sessions included.
+  - `orchestrate` only makes sense where Codex is signed in, i.e. Claude Code on your machine.
+- **Why no MCP server:** Claude Code has a shell, so a skill plus a CLI costs nothing until it's used. An MCP server's tool definitions would sit in context on every turn. MCP would only be needed for clients without a shell, such as plain Claude chat, and there orc can't reach your Codex login anyway.
+
+## Security
+
+- **Checks run outside the sandbox.** Plan `checks` run on the user's machine, outside the Codex sandbox, on code a worker wrote. A worker could change a test or a `package.json` script. Only configure checks you'd run on an untrusted branch. Running checks inside `codex sandbox` is a possible hardening step, but not implemented.
+- **Web findings are marked untrusted.** Explorer or reviewer findings from `web = true` tasks are labelled as untrusted data in later workers' prompts. Web pages are a prompt-injection path into implementers.
+- **Branch cleanup is limited.** `merge` and `clean` only remove orc's own worktrees (under `~/.orc/worktrees`) and `orc/<run>/…` branches. Failed repair rounds are committed first, so their work isn't lost.
 
 ## Why a CLI and a skill (not an MCP server, not Claude subagents)
 
@@ -93,6 +114,9 @@ Everything is tested against a fake `codex` (`tests/fake_codex.py`), because Cod
 6. **Web search.** orc enables it with `-c web_search="live"`, which secondary sources say replaced the removed `--search` flag. Confirm that a `--web` ask shows `web_search` events in `.orc/asks/<id>.events.jsonl`.
 7. **Network.** `workspace-write` blocks network by default. Set `network = true` for tasks that install packages.
 8. **Status line.** `rate_limits` appears only for Pro and Max plans. On other plans, the Claude limit column shows "n/a".
+9. **Per-turn vs cumulative usage.** orc adds up `turn.completed.usage` for each call. If `codex exec resume` reports the thread's cumulative total instead of the new turn's, repairs and steers are over-counted. Compare one repaired task's numbers with its rollout file's final `total_token_usage`. If they are cumulative, subtract the previous call's total on the same thread in `codex_exec()`.
+10. **`resume` keeps exec flags.** A repair has to keep `-C` (the worktree), `-s workspace-write` and `--output-schema`. Check one repair's events and final JSON.
+11. **Schema metadata.** The schemas carry `$schema` and `title` at the top level. If strict mode rejects them, remove both.
 
 ## Deliberate non-goals (for now)
 

@@ -1,10 +1,13 @@
 ---
 name: orchestrate
-description: Lead coding tasks with Codex (GPT) workers through the `orc` CLI. Use for any non-trivial coding, refactoring, debugging, review or codebase-research task. Decides whether to do the work yourself, hand it to one worker, or run a small team; plans it, runs it with independent verification, and ends with a token, cost and usage-limit report.
-allowed-tools: Bash(orc ask:*), Bash(orc check:*), Bash(orc run:*), Bash(orc steer:*), Bash(orc merge:*), Bash(orc report:*), Bash(orc doctor)
+description: Lead coding tasks with OpenAI Codex (GPT) workers through the bundled `orc` CLI. Use for any non-trivial coding, refactoring, debugging, review or codebase-research task. Decides whether to do the work yourself, hand it to one worker, or run a small team; plans it, runs it with independent verification, and ends with a token, cost and usage-limit report.
+compatibility: Claude Code with a local shell. Needs Python 3.11+, git, and the Codex CLI signed in (`codex login`).
+allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/orc *)
 ---
 
 # Lead with Codex workers
+
+**Run orc as `python3 ${CLAUDE_SKILL_DIR}/scripts/orc <command>`** (written `orc` below; always use the full form, which is pre-approved). If a command fails because Codex is missing or signed out, run `orc doctor` and relay its fix to the user.
 
 You are the lead engineer. Workers are Codex runs (GPT-6.1 Sol on the user's ChatGPT plan), launched by `orc`. Your job is judgment: decide the split, write precise briefs, check evidence, integrate. Aim for the best result with the least total spend: your tokens, Codex quota (ChatGPT Plus allows roughly 15–160 Sol messages per 5 hours) and the user's time. Multi-agent work costs many times the tokens of doing a task directly, so it has to earn its cost.
 
@@ -29,7 +32,7 @@ Pick the smallest mode that does the job well:
 
 - Parallelize reading freely. Parallelize writing only across disjoint files; tightly coupled changes go to one implementer. Parallel writers make conflicting hidden decisions.
 - Don't delegate a small change you would have to re-read completely to trust.
-- Check the status line: if Codex's 5h window is at 80% or more, prefer Solo or a smaller plan and tell the user.
+- `orc check` prints current Codex and Claude limits. If a 5h window is at 80% or more, prefer Solo or a smaller plan and tell the user.
 - Prefer `orc` workers over Claude subagents (the Agent tool), which spend the user's Claude usage.
 
 ## 2. Plan (Single and Team)
@@ -59,15 +62,16 @@ The run summary normally has everything you need. Open files under `.orc/runs/` 
 - **verified / checks-passed**: at low or medium risk, trust the gates; don't re-review the whole diff. At high risk, read the diff yourself: you are the cross-model check.
 - **failed / uncertain**: take the cheapest fix that works:
   - Trivial: fix it yourself after merging.
-  - Clear feedback: `orc steer <run> <task> "<specific fix>"`. This reuses the worker's warm context and re-checks and re-verifies automatically.
+  - Clear feedback: `orc steer <run> <task> "<specific fix>"`. This reuses the worker's warm context and re-checks and re-verifies automatically. If tasks were skipped because of the failure, `orc resume <run>` runs them afterwards.
   - Wrong approach: rewrite the brief and re-plan.
   - After two failed rounds on the same task, do it yourself or ask the user.
 - Explorer findings are claims: spot-check the one or two that your decisions rest on.
-- `orc merge <run> && <project test command>` in one call, then fix anything the combined result breaks.
+- `orc merge <run> && <project test command>` in one call (merge exits non-zero on a conflict), then fix anything the combined result breaks.
+- `blocked` means the worker stopped to ask something: answer its open question with `orc steer`, or re-plan.
 
 ## 5. Report (always, also for Solo work)
 
-At the end run `orc report` once and include its output in your final message, with one line on who did what. It shows tokens, API-equivalent cost and usage-limit percentages for Codex and for this Claude session. Don't compute these yourself.
+At the end run `orc report` once and include its output in your final message, with one line on who did what. It shows tokens, API-equivalent cost and usage-limit percentages for Codex and for this Claude session. Don't compute these yourself. If it says no status line snapshot was found, tell the user to run `orc setup` once.
 
 ## Efficiency rules
 

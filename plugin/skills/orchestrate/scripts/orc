@@ -6,7 +6,8 @@ deterministic checks, an independent verifier, and a bounded repair loop. It the
 prints a compact summary, and `orc report` shows tokens, API-equivalent cost and
 usage-limit percentages for both Codex and Claude.
 
-Standard library only (Python 3.11+). See README.md and docs/design.md.
+Standard library only (Python 3.11+). Ships inside the `orchestrate` skill; run it as
+`python3 <skill>/scripts/orc <command>`. `orc setup` installs a stable copy for the status line.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -24,7 +26,7 @@ import time
 import tomllib
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent  # the skill's scripts/ folder: prompts, schemas, pricing
 PROMPTS = ROOT / "prompts"
 SCHEMAS = ROOT / "schemas"
 PRICING = ROOT / "pricing.toml"
@@ -1162,7 +1164,7 @@ def cmd_report(a) -> int:
                    f"{fmt_tok(u['output_tokens'])} output) · ≈ ${c_cost:.2f} API-equivalent · "
                    f"{fmt_windows(claude_windows(claude), claude_windows(claude.get('first')))}")
     else:
-        out.append("**Claude:** no statusline snapshot found; set `orc statusline` as the status line command (see README).")
+        out.append("**Claude:** no statusline snapshot found for this project; run `orc setup` once (it sets the status line).")
     out.append(f"**Total ≈ ${cost + (c_cost or 0):.2f} API-equivalent** (what these tokens would cost at API list prices; "
                "subscription usage is shown as limit percentages).")
     print("\n".join(out))
@@ -1231,6 +1233,31 @@ def cmd_statusline(a) -> int:
     return 0
 
 
+def cmd_setup(a) -> int:
+    """Copy orc to a stable place (plugin paths change on update) and point Claude Code's status line at it."""
+    app = ORC_HOME / "app"
+    if app.resolve() != ROOT:
+        shutil.rmtree(app, ignore_errors=True)
+        shutil.copytree(ROOT, app, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    command = f'python3 "{app / "orc"}" statusline'
+    path = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "settings.json"
+    settings = read_json(path, {}) if path.exists() else {}
+    if not isinstance(settings, dict):
+        print(f"{path} is not valid JSON; not changing it. Set statusLine.command to: {command}")
+        return 1
+    current = settings.get("statusLine") or {}
+    if current and "orc" not in str(current.get("command", "")) and not a.force:
+        print(f"Your status line is already set to `{current.get('command')}`; left unchanged.\n"
+              f"To use orc's, run `orc setup --force` or set statusLine.command to: {command}")
+    else:
+        settings["statusLine"] = {"type": "command", "command": command, "refreshInterval": 30}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(path, settings)
+        print(f"Status line set in {path} (restart Claude Code to see it).")
+    print(f"orc copied to {app}/orc. For manual use: alias orc='python3 \"{app}/orc\"'")
+    return 0
+
+
 def cmd_doctor(a) -> int:
     ok = True
     def line(good, msg):
@@ -1247,7 +1274,7 @@ def cmd_doctor(a) -> int:
     line(sys.version_info >= (3, 11), f"python {sys.version.split()[0]} (needs 3.11+)")
     line(repo_root() is not None, "inside a git repository" if repo_root() else "not in a git repository (implementers need one)")
     snap = claude_snapshot()
-    line(snap is not None, "Claude statusline snapshot found" if snap else "no Claude statusline snapshot; configure `orc statusline` (README)")
+    line(snap is not None, "Claude statusline snapshot found" if snap else "no Claude statusline snapshot yet; run `orc setup`, then restart Claude Code")
     print(f"Codex limits: {fmt_windows(codex_windows(codex_limits()))}")
     return 0 if ok else 1
 
@@ -1283,10 +1310,12 @@ def main(argv=None) -> int:
     p.add_argument("--research", action="store_true", help="multi-source web research; full report to a file, summary printed")
     p.add_argument("--timeout", type=int, help="minutes (default 10, research 30)")
     sub.add_parser("statusline", help="Claude Code statusLine command (reads session JSON on stdin)")
+    p = sub.add_parser("setup", help="install a stable copy of orc and set Claude Code's status line to it")
+    p.add_argument("--force", action="store_true", help="replace an existing non-orc status line")
     sub.add_parser("doctor", help="check codex, login, git and statusline setup")
     a = ap.parse_args(argv)
     return {"check": cmd_check, "run": cmd_run, "steer": cmd_steer, "resume": cmd_resume, "merge": cmd_merge, "clean": cmd_clean,
-            "report": cmd_report, "ask": cmd_ask, "statusline": cmd_statusline, "doctor": cmd_doctor}[a.cmd](a)
+            "report": cmd_report, "ask": cmd_ask, "setup": cmd_setup, "statusline": cmd_statusline, "doctor": cmd_doctor}[a.cmd](a)
 
 
 if __name__ == "__main__":

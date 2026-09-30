@@ -1,0 +1,12 @@
+{
+  "name": "orc-tools",
+  "description": "orc: a Claude Code plugin where Claude leads and Codex workers do the work, with independent verification.",
+  "owner": { "name": "SteliosRapt" },
+  "plugins": [
+    {
+      "name": "orc",
+      "source": "./plugin",
+      "description": "Lead coding tasks with Codex workers (orchestrate) plus portable delegation guidance (delegate)."
+    }
+  ]
+}

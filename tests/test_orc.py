@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ORC = [sys.executable, str(ROOT / "bin" / "orc")]
+ORC = [sys.executable, str(ROOT / "plugin" / "skills" / "orchestrate" / "scripts" / "orc")]
 
 PLAN = textwrap.dedent('''
     goal = "Demo: add two files and a follow-up"
@@ -326,10 +326,41 @@ class OrcTest(unittest.TestCase):
         self.orc("statusline", stdin=json.dumps(other))
         self.assertIn("no statusline snapshot found", self.orc("report").stdout)       # audit #12
 
+    def test_setup_installs_copy_and_statusline(self):
+        cfg = self.tmp / "claude-config"
+        self.env["CLAUDE_CONFIG_DIR"] = str(cfg)
+        cfg.mkdir()
+        (cfg / "settings.json").write_text(json.dumps({"model": "opus", "statusLine": {"type": "command", "command": "mine.sh"}}))
+        p = self.orc("setup")
+        self.assertIn("left unchanged", p.stdout)                           # never clobbers a user's status line
+        self.assertEqual(json.loads((cfg / "settings.json").read_text())["statusLine"]["command"], "mine.sh")
+        self.orc("setup", "--force")
+        settings = json.loads((cfg / "settings.json").read_text())
+        self.assertEqual(settings["model"], "opus")                          # other settings kept
+        app = Path(self.env["ORC_HOME"]) / "app" / "orc"
+        self.assertIn(str(app), settings["statusLine"]["command"])
+        p = subprocess.run([sys.executable, str(app), "statusline"], input=json.dumps({"model": {"display_name": "Opus"}}),
+                           text=True, capture_output=True, env=self.env)
+        self.assertEqual(p.stdout.strip(), "Opus")
+
     def test_report_without_runs(self):
         p = self.orc("report")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("done by the lead alone", p.stdout)
+
+
+class PackagingTest(unittest.TestCase):
+    def test_dist_skills_match_sources(self):
+        p = subprocess.run([sys.executable, str(ROOT / "tools" / "build_skills.py"), "--check"], text=True, capture_output=True)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_plugin_layout(self):
+        manifest = json.loads((ROOT / "plugin" / ".claude-plugin" / "plugin.json").read_text())
+        market = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text())
+        self.assertEqual(market["plugins"][0]["name"], manifest["name"])
+        self.assertTrue((ROOT / market["plugins"][0]["source"] / "skills" / "orchestrate" / "SKILL.md").exists())
+        skill = (ROOT / "plugin" / "skills" / "orchestrate" / "SKILL.md").read_text()
+        self.assertIn("allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/orc *)", skill)
 
 
 if __name__ == "__main__":
