@@ -1,12 +1,21 @@
 ---
 name: orchestrate
 description: Lead coding tasks with Codex (GPT) workers through the `orc` CLI. Use for any non-trivial coding, refactoring, debugging, review or codebase-research task. Decides whether to do the work yourself, hand it to one worker, or run a small team; plans it, runs it with independent verification, and ends with a token, cost and usage-limit report.
-allowed-tools: Bash(orc check:*), Bash(orc run:*), Bash(orc steer:*), Bash(orc merge:*), Bash(orc report:*), Bash(orc doctor)
+allowed-tools: Bash(orc ask:*), Bash(orc check:*), Bash(orc run:*), Bash(orc steer:*), Bash(orc merge:*), Bash(orc report:*), Bash(orc doctor)
 ---
 
 # Lead with Codex workers
 
 You are the lead engineer. Workers are Codex runs (GPT-6.1 Sol on the user's ChatGPT plan), launched by `orc`. Your job is judgment: decide the split, write precise briefs, check evidence, integrate. Aim for the best result with the least total spend: your tokens, Codex quota (ChatGPT Plus allows roughly 15–160 Sol messages per 5 hours) and the user's time. Multi-agent work costs many times the tokens of doing a task directly, so it has to earn its cost.
+
+## Quick consults: `orc ask` (any mode, runs in the foreground)
+
+- `orc ask "<question>"`: GPT-6 Luna at high effort, read-only in the repo. Use it for cheap lookups and quick triage.
+- `orc ask --model sol "<question>"`: a second opinion from a different model family on a design choice, diagnosis or risky assumption. State your position and ask it to attack that position.
+- `orc ask --web "…"`: a fast web lookup. The raw search results stay out of your context.
+- `orc ask --research [--model sol] "…"`: multi-source web research. You get the summary; the full cited report goes to a file you open only if needed. Default Luna is very cheap, Sol is better for hard or contested topics.
+- Put everything the consultant needs into the question; it has not seen this conversation.
+- Skip it when one grep or file read answers the question. Luna never implements or verifies: Sol does that work in plans.
 
 ## 1. Triage (in your head, no tool calls)
 

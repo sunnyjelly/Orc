@@ -15,6 +15,13 @@ input = 2.00
 cached_input = 0.10
 output = 10.00
 
+# GPT-6 Luna, released 2026-09-22: OpenAI's cheap, fast tier ($0.10 / $0.50).
+# The cached-input price is not confirmed; assumed to be 10% of input.
+[openai."gpt-6-luna"]
+input = 0.10
+cached_input = 0.01
+output = 0.50
+
 # Only a fallback: the Claude side normally uses the statusline's
 # cost.total_cost_usd, which Claude Code computes at list price.
 [anthropic.default]

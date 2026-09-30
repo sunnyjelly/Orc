@@ -77,6 +77,10 @@ Researched 2026-09-30. Sources are listed at the bottom; the "→" lines say how
   - Above 272k input: $4 / $0.20 / $15.
   - Efforts low…max; Codex also lists `ultra`; no none/minimal. [O4][O5]
   - ChatGPT Plus: roughly 15–160 Sol messages per 5h, plus weekly limits. [O6]
+- **GPT-6 Luna** (`gpt-6-luna`, released 2026-09-22; there is no 6.1 Luna yet):
+  - OpenAI's efficient tier: $0.10 input / $0.50 output per 1M tokens.
+  - 1.05M context.
+  - In Codex for Plus and above. Suited to high-volume and lightweight agentic tasks; stronger at higher effort. [O7]
 - **Claude Opus 5.5**:
   - $4 input / $20 output per 1M tokens; cache reads $0.20; 5-minute cache writes 1.25× input.
   - Default effort `medium`. [A4]
@@ -103,3 +107,5 @@ Researched 2026-09-30. Sources are listed at the bottom; the "→" lines say how
 - [O4] OpenAI, GPT-6.1 Sol model page: https://developers.openai.com/api/docs/models/gpt-6.1-sol
 - [O5] Pricing coverage: https://mixed-news.com/en/gpt-6-1-sol-pricing-cached-input-halved/
 - [O6] Codex usage limits overview: https://simplemetrics.xyz/chatgpt-codex-limits-2026/
+- [O7] OpenAI, *Introducing GPT-6 Sol and Luna*: https://openai.com/index/introducing-gpt-6-sol-and-luna/ ; GitHub changelog: https://github.blog/changelog/2026-09-22-openais-gpt-6-sol-and-gpt-6-luna-now-available/
+- [O8] Codex web search in exec mode (`-c web_search="live"`): https://github.com/parisbs/codex-subagent-mcp/pull/49

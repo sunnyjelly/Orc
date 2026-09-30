@@ -22,6 +22,8 @@ network = false               # let implementers use the network (e.g. package i
 [[task]]
 id = "map-auth"            # lowercase-kebab, unique
 role = "explorer"          # explorer | reviewer (read-only) | implementer (writes, in its own worktree)
+model = "luna"             # optional: sol (default, gpt-6.1-sol) | luna (gpt-6-luna, cheap: simple scouting only) | full id
+web = true                 # optional, explorer/reviewer only: live web search
 why = "Shown to the user and to other workers: why this task exists and why it is delegated"
 brief = """What to find or do. See briefs.md."""
 

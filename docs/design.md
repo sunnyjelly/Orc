@@ -42,6 +42,21 @@ orc (one stdlib Python file)
 | verifier (internal) | read-only | high | implementer's worktree | fresh thread every round |
 | adversary (internal) | read-only | xhigh | implementer's worktree | fresh thread |
 
+## Consults (`orc ask`)
+
+A consult is a single read-only Codex call that runs in the foreground, with no plan, worktree or verifier. There are three uses:
+- **Second opinion**: `--model sol`. A different model family catches different mistakes.
+- **Quick lookup**: `--web` turns on Codex live web search (`-c web_search="live"`).
+- **Deep research**: `--research`. A research preamble makes one agentic call search, cross-check and write a cited Markdown report to `.orc/asks/<id>.final.md`. The lead gets only the `## Summary` section and the file path.
+
+The default model is **GPT-6 Luna at high effort**, which is cheap enough to use freely; Luna at low effort is too weak to be useful. Luna is never used for implementation or verification.
+
+Deep research is a flag on `ask`, not a plan feature. Research needs no worktrees, checks or merges, and one agentic call already runs many searches. For broad research that splits into independent areas, a plan with several `web = true` explorers does it in parallel.
+
+Each consult is appended to `.orc/asks/asks.jsonl` with its usage and cost. `orc report` includes this session's consults as `ask ×N` and `research ×N` rows.
+
+Model short names live in `MODEL_ALIASES`: `sol` → `gpt-6.1-sol`, `luna` → `gpt-6-luna`. Update them when OpenAI ships new versions.
+
 ## Principles → mechanisms
 
 | Principle (see research/findings.md) | Mechanism |
@@ -71,12 +86,13 @@ orc (one stdlib Python file)
 Everything is tested against a fake `codex` (`tests/fake_codex.py`), because Codex can't be logged in from the cloud container where this was built. Before trusting results, check these:
 
 1. **`codex exec ... resume <id> -` flag order.** orc passes the exec flags (`--json -o --output-schema -m -c -s -C`) before `resume`. If a Codex version rejects that, adjust `Run.codex()`: the order is built in one place.
-2. **Model id and efforts.** `gpt-6.1-sol` with `model_reasoning_effort` in `{low, medium, high, xhigh, max, ultra}`. Check with `codex` → `/model`.
+2. **Model ids and efforts.** `gpt-6.1-sol` and `gpt-6-luna` with `model_reasoning_effort` in `{low, medium, high, xhigh, max, ultra}`. Check with `codex` → `/model`.
 3. **Strict output schemas.** Both schemas use `additionalProperties: false`, and every property is required, which strict structured output needs.
 4. **Rate limits in rollout files.** `orc doctor` prints the limits it finds. If they show "n/a" after a run, the rollout format changed; see `codex_limits()`.
 5. **Commits inside worktrees.** The Codex sandbox may block `.git` writes from the worker. orc commits on the worker's behalf outside the sandbox.
-6. **Network.** `workspace-write` blocks network by default. Set `network = true` for tasks that install packages.
-7. **Status line.** `rate_limits` appears only for Pro and Max plans. On other plans, the Claude limit column shows "n/a".
+6. **Web search.** orc enables it with `-c web_search="live"`, which secondary sources say replaced the removed `--search` flag. Confirm that a `--web` ask shows `web_search` events in `.orc/asks/<id>.events.jsonl`.
+7. **Network.** `workspace-write` blocks network by default. Set `network = true` for tasks that install packages.
+8. **Status line.** `rate_limits` appears only for Pro and Max plans. On other plans, the Claude limit column shows "n/a".
 
 ## Deliberate non-goals (for now)
 

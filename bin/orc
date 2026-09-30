@@ -33,6 +33,8 @@ CODEX = os.environ.get("ORC_CODEX_BIN", "codex")
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 
 DEFAULT_MODEL = "gpt-6.1-sol"
+# Short names the lead can use. Update when OpenAI ships newer versions (e.g. a 6.1 Luna).
+MODEL_ALIASES = {"sol": "gpt-6.1-sol", "luna": "gpt-6-luna"}
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ROLES = {
     "explorer":    {"sandbox": "read-only",       "writes": False, "effort": "medium"},
@@ -100,6 +102,20 @@ def read_json(path: Path, default=None):
         return json.loads(Path(path).read_text())
     except (OSError, ValueError):
         return default
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
 
 
 def add_usage(a: dict, b: dict) -> dict:
@@ -302,6 +318,10 @@ def claude_tokens(transcript: str | None) -> dict:
 
 # ---------------------------------------------------------------- plan
 
+def resolve_model(name: str) -> str:
+    return MODEL_ALIASES.get(name, name)
+
+
 def load_plan(path: str) -> tuple[dict, list[str], list[str]]:
     """Parse and validate a plan. Returns (plan, errors, warnings)."""
     try:
@@ -337,7 +357,10 @@ def load_plan(path: str) -> tuple[dict, list[str], list[str]]:
                 errs.append(f"{tid}: missing `{field}`")
         t["writes"] = ROLES[role]["writes"]
         t["sandbox"] = ROLES[role]["sandbox"]
-        t["model"] = t.get("model") or defaults.get("model") or DEFAULT_MODEL
+        t["model"] = resolve_model(t.get("model") or defaults.get("model") or DEFAULT_MODEL)
+        t["web"] = bool(t.get("web", False))
+        if t["web"] and t["writes"]:
+            errs.append(f"{tid}: `web` is for explorer/reviewer tasks; research first, then implement")
         t["effort"] = t.get("effort") or defaults.get(f"{role}_effort") or ROLES[role]["effort"]
         if t["effort"] not in EFFORTS:
             errs.append(f"{tid}: effort must be one of {', '.join(EFFORTS)}")
@@ -449,18 +472,88 @@ def codex_call_estimate(plan: dict) -> tuple[int, int]:
 
 
 def render_plan(plan: dict) -> str:
-    rows = ["| # | task | role · effort | after | verification | why |", "|---|---|---|---|---|---|"]
+    rows = ["| # | task | role · model effort | after | verification | why |", "|---|---|---|---|---|---|"]
     for i, t in enumerate(plan["task"], 1):
-        rows.append(f"| {i} | {t['id']} | {t['role']} · {t['effort']} | {', '.join(t['after']) or '-'} | "
+        short = next((k for k, v in MODEL_ALIASES.items() if v == t["model"]), t["model"])
+        rows.append(f"| {i} | {t['id']} | {t['role']} · {short} {t['effort']}{' · web' if t['web'] else ''} | {', '.join(t['after']) or '-'} | "
                     f"{verify_label(t)} | {clip(t['why'], 90)} |")
     lo, hi = codex_call_estimate(plan)
     lines = [f"**Plan:** {plan['goal']}  (risk: {plan['risk']}, max parallel: {plan.get('max_parallel', 3)})", "", *rows, "",
-             f"Codex calls: {lo} (up to {hi} with repairs) on {plan['task'][0]['model']}. "
+             f"Codex calls: {lo} (up to {hi} with repairs). "
              f"Codex {fmt_windows(codex_windows(codex_limits()))} · Claude {fmt_windows(claude_windows(claude_snapshot()))}"]
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- codex execution
+
+def quota_blocked(quota_stop: float) -> str | None:
+    for label, (pct, _) in codex_windows(read_json(ORC_HOME / "codex-limits.json")).items():
+        if pct >= quota_stop:
+            return f"Codex {label} limit at {pct:.0f}% (quota_stop={quota_stop:.0f})"
+    return None
+
+
+def codex_exec(*, model: str, effort: str, sandbox: str, cwd: Path, prompt: str, logdir: Path, name: str,
+               schema: str | None = None, resume: str | None = None, network: bool = False, web: bool = False,
+               timeout_min: int = 30, slots: threading.Semaphore | None = None, quota_stop: float = 90,
+               pricing: dict | None = None) -> dict:
+    """Run one `codex exec` call; return a call record (thread, usage, final JSON or text, cost)."""
+    out = logdir / f"{name}.final.{'json' if schema else 'md'}"
+    cmd = [CODEX, "exec", "--json", "-o", str(out)]
+    if schema:
+        cmd += ["--output-schema", str(SCHEMAS / f"{schema}.schema.json")]
+    cmd += ["-m", model, "-c", f'model_reasoning_effort="{effort}"', "-s", sandbox, "-C", str(cwd), "--skip-git-repo-check"]
+    if sandbox == "workspace-write" and network:
+        cmd += ["-c", "sandbox_workspace_write.network_access=true"]
+    if web:
+        cmd += ["-c", 'web_search="live"']
+    if resume:
+        cmd += ["resume", resume]
+    cmd.append("-")
+    logdir.mkdir(parents=True, exist_ok=True)
+    (logdir / f"{name}.prompt.md").write_text(prompt)
+    rec = {"name": name, "thread": None, "usage": {k: 0 for k in USAGE_KEYS}, "final": None, "error": None,
+           "effort": effort, "model": model}
+    if (why := quota_blocked(quota_stop)):
+        rec["error"] = f"skipped: {why}"
+        return rec
+    with (slots or threading.Semaphore()):
+        start = time.time()
+        with open(logdir / f"{name}.events.jsonl", "w") as ev, open(logdir / f"{name}.stderr.log", "w") as er:
+            try:
+                p = subprocess.run(cmd, input=prompt, text=True, stdout=ev, stderr=er, timeout=timeout_min * 60)
+                rc = p.returncode
+            except subprocess.TimeoutExpired:
+                rc = "timeout"
+            except FileNotFoundError:
+                rc = "codex not found (set ORC_CODEX_BIN or install @openai/codex)"
+        rec["seconds"] = round(time.time() - start, 1)
+    for line in (logdir / f"{name}.events.jsonl").read_text(errors="replace").splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        kind = ev.get("type")
+        if kind == "thread.started":
+            rec["thread"] = ev.get("thread_id")
+        elif kind == "turn.completed":
+            rec["usage"] = add_usage(rec["usage"], ev.get("usage") or {})
+        elif kind in ("turn.failed", "error"):
+            rec["error"] = clip((ev.get("error") or {}).get("message") or ev.get("message") or kind, 300)
+    rec["thread"] = rec["thread"] or resume
+    try:
+        text = out.read_text()
+        rec["final"] = json.loads(text) if schema else (text.strip() or None)
+    except (OSError, ValueError):
+        pass
+    if rec["final"] is None and not rec["error"]:
+        rec["error"] = f"exit {rc}; no valid final message" + (f": {clip(tail((logdir / f'{name}.stderr.log').read_text(), 3), 300)}" if rc else "")
+    if rc not in (0, None) and not rec["error"]:
+        rec["error"] = f"exit {rc}"
+    rec["cost"] = round(openai_cost(model, rec["usage"], pricing if pricing is not None else load_pricing()), 4)
+    save_codex_limits(codex_limits(rec["thread"]))
+    return rec
+
 
 class Run:
     def __init__(self, plan: dict, repo: Path | None, run_dir: Path, run_id: str, base: str | None):
@@ -483,65 +576,12 @@ class Run:
     def log(self, msg: str):
         print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
-    def quota_blocked(self) -> str | None:
-        for label, (pct, _) in codex_windows(read_json(ORC_HOME / "codex-limits.json")).items():
-            if pct >= self.quota_stop:
-                return f"Codex {label} limit at {pct:.0f}% (quota_stop={self.quota_stop:.0f})"
-        return None
-
     def codex(self, task: dict, name: str, prompt: str, schema: str, cwd: Path, sandbox: str,
               resume: str | None = None, effort: str | None = None) -> dict:
-        """Run one `codex exec` call; return a call record (thread, usage, parsed final JSON)."""
-        tdir = self.dir / task["id"]
-        out = tdir / f"{name}.final.json"
-        cmd = [CODEX, "exec", "--json", "-o", str(out), "--output-schema", str(SCHEMAS / f"{schema}.schema.json"),
-               "-m", task["model"], "-c", f'model_reasoning_effort="{effort or task["effort"]}"',
-               "-s", sandbox, "-C", str(cwd), "--skip-git-repo-check"]
-        if sandbox == "workspace-write" and task["network"]:
-            cmd += ["-c", "sandbox_workspace_write.network_access=true"]
-        if resume:
-            cmd += ["resume", resume]
-        cmd.append("-")
-        (tdir / f"{name}.prompt.md").write_text(prompt)
-        rec = {"name": name, "thread": None, "usage": {k: 0 for k in USAGE_KEYS}, "final": None, "error": None,
-               "effort": effort or task["effort"], "model": task["model"]}
-        if (why := self.quota_blocked()):
-            rec["error"] = f"skipped: {why}"
-            return rec
-        with self.slots:
-            start = time.time()
-            with open(tdir / f"{name}.events.jsonl", "w") as ev, open(tdir / f"{name}.stderr.log", "w") as er:
-                try:
-                    p = subprocess.run(cmd, input=prompt, text=True, stdout=ev, stderr=er, timeout=task["timeout_min"] * 60)
-                    rc = p.returncode
-                except subprocess.TimeoutExpired:
-                    rc = "timeout"
-                except FileNotFoundError:
-                    rc = "codex not found (set ORC_CODEX_BIN or install @openai/codex)"
-            rec["seconds"] = round(time.time() - start, 1)
-        for line in (tdir / f"{name}.events.jsonl").read_text(errors="replace").splitlines():
-            try:
-                ev = json.loads(line)
-            except ValueError:
-                continue
-            kind = ev.get("type")
-            if kind == "thread.started":
-                rec["thread"] = ev.get("thread_id")
-            elif kind == "turn.completed":
-                rec["usage"] = add_usage(rec["usage"], ev.get("usage") or {})
-            elif kind in ("turn.failed", "error"):
-                rec["error"] = clip((ev.get("error") or {}).get("message") or ev.get("message") or kind, 300)
-        rec["thread"] = rec["thread"] or resume
-        try:
-            rec["final"] = json.loads(out.read_text())
-        except (OSError, ValueError):
-            if not rec["error"]:
-                rec["error"] = f"exit {rc}; no valid final JSON" + (f": {clip(tail((tdir / f'{name}.stderr.log').read_text(), 3), 300)}" if rc else "")
-        if rc not in (0, None) and not rec["error"]:
-            rec["error"] = f"exit {rc}"
-        rec["cost"] = round(openai_cost(task["model"], rec["usage"], self.pricing), 4)
-        save_codex_limits(codex_limits(rec["thread"]))
-        return rec
+        return codex_exec(model=task["model"], effort=effort or task["effort"], sandbox=sandbox, cwd=cwd, prompt=prompt,
+                          logdir=self.dir / task["id"], name=name, schema=schema, resume=resume,
+                          network=task["network"], web=task["web"], timeout_min=task["timeout_min"],
+                          slots=self.slots, quota_stop=self.quota_stop, pricing=self.pricing)
 
     # ------------------------------------------------------------ prompts
 
@@ -975,33 +1015,46 @@ def cmd_report(a) -> int:
         all_runs = sorted(p for p in d.iterdir() if (p / "state.json").exists())
         run_dirs = [p for p in all_runs if sid and read_json(p / "state.json", {}).get("claude_session") == sid] or all_runs[-1:]
     states = [read_json(p / "state.json") for p in run_dirs]
+    asks = [x for x in read_jsonl(d.parent / "asks" / "asks.jsonl")
+            if (x.get("claude_session") == sid if sid else True) and not a.runs]
     pricing = load_pricing()
     out = []
-    usage, cost, calls, first_codex = {k: 0 for k in USAGE_KEYS}, 0.0, 0, None
-    if states:
-        out += [f"### Task report — {states[-1]['goal']}", "",
+    usage, cost, calls, first_codex, models = {k: 0 for k in USAGE_KEYS}, 0.0, 0, None, set()
+
+    def row(name, kind, result, cs):
+        nonlocal usage, cost, calls
+        u = {k: 0 for k in USAGE_KEYS}
+        for c in cs:
+            u = add_usage(u, c.get("usage") or {})
+            models.add(c.get("model") or DEFAULT_MODEL)
+        c_cost = sum(c.get("cost") or 0 for c in cs)
+        usage, cost, calls = add_usage(usage, u), cost + c_cost, calls + len(cs)
+        out.append(f"| {name} | {kind} | {result} | {len(cs)} | {fmt_tok(u['input_tokens'])} ({fmt_tok(u['cached_input_tokens'])}) / "
+                   f"{fmt_tok(u['output_tokens'])} | ${c_cost:.2f} | {fmt_secs(sum(c.get('seconds') or 0 for c in cs))} |")
+
+    if states or asks:
+        title = states[-1]["goal"] if states else "lead work with Codex consultations"
+        out += [f"### Task report — {title}", "",
                 "| task | role · effort | result | calls | tokens in (cached) / out | ≈ API $ | time |", "|---|---|---|---|---|---|---|"]
         for s in states:
             first_codex = first_codex or s.get("codex_start")
             for tid in s["order"]:
-                r = s["tasks"].get(tid)
-                if not r:
-                    continue
-                u = {k: 0 for k in USAGE_KEYS}
-                for c in r.get("calls", []):
-                    u = add_usage(u, c.get("usage") or {})
-                c_cost = sum(c.get("cost") or 0 for c in r.get("calls", []))
-                secs = sum(c.get("seconds") or 0 for c in r.get("calls", []))
-                usage, cost, calls = add_usage(usage, u), cost + c_cost, calls + len(r.get("calls", []))
-                out.append(f"| {tid} | {r.get('role', '?')} · {r.get('effort', '?')} | {r['status']}{' (merged)' if r.get('merged') else ''} | "
-                           f"{len(r.get('calls', []))} | {fmt_tok(u['input_tokens'])} ({fmt_tok(u['cached_input_tokens'])}) / {fmt_tok(u['output_tokens'])} | "
-                           f"${c_cost:.2f} | {fmt_secs(secs)} |")
-        model = next((c.get("model") for s in states for r in s["tasks"].values() for c in r.get("calls", []) if c.get("model")), DEFAULT_MODEL)
-        out += ["", f"**Codex ({model}, ChatGPT plan):** {calls} calls · {fmt_tok(usage['input_tokens'] + usage['output_tokens'])} tokens "
+                if (r := s["tasks"].get(tid)):
+                    row(tid, f"{r.get('role', '?')} · {r.get('effort', '?')}",
+                        f"{r['status']}{' (merged)' if r.get('merged') else ''}", r.get("calls", []))
+        groups: dict[tuple, list] = {}
+        for x in asks:
+            groups.setdefault(("research" if x.get("research") else "ask", x.get("model"), x.get("effort")), []).append(x)
+        for (kind, model, effort), xs in groups.items():
+            short = next((k for k, v in MODEL_ALIASES.items() if v == model), model)
+            fails = sum(1 for x in xs if x.get("error"))
+            row(f"{kind} ×{len(xs)}", f"{short} · {effort}", f"{len(xs) - fails} ok" + (f", {fails} failed" if fails else ""), xs)
+        first_codex = first_codex or (asks[0].get("codex_start") if asks else None)
+        out += ["", f"**Codex ({', '.join(sorted(models))}, ChatGPT plan):** {calls} calls · {fmt_tok(usage['input_tokens'] + usage['output_tokens'])} tokens "
                     f"({fmt_tok(usage['cached_input_tokens'])} cached input, {fmt_tok(usage['output_tokens'])} output) · ≈ ${cost:.2f} API-equivalent · "
                     f"{fmt_windows(codex_windows(read_json(ORC_HOME / 'codex-limits.json')), codex_windows(first_codex))}"]
     else:
-        out += ["### Task report (no Codex runs: done by the lead alone)", ""]
+        out += ["### Task report (no Codex calls: done by the lead alone)", ""]
     c_cost = 0.0
     if claude:
         tok = claude_tokens(claude.get("transcript_path"))
@@ -1020,6 +1073,36 @@ def cmd_report(a) -> int:
     out.append(f"**Total ≈ ${cost + (c_cost or 0):.2f} API-equivalent** (what these tokens would cost at API list prices; "
                "subscription usage is shown as limit percentages).")
     print("\n".join(out))
+    return 0
+
+
+def cmd_ask(a) -> int:
+    repo = repo_root()
+    d = runs_dir(repo).parent / "asks"
+    ask_id = dt.datetime.now().strftime("%m%d-%H%M%S-%f")[:-3]
+    question = sys.stdin.read() if a.question == "-" else a.question
+    prompt = (PROMPTS / ("research.md" if a.research else "ask.md")).read_text().strip() + f"\n\n## Question\n{question.strip()}\n"
+    codex_start = read_json(ORC_HOME / "codex-limits.json") or codex_limits()
+    model = resolve_model(a.model)
+    rec = codex_exec(model=model, effort=a.effort, sandbox="read-only", cwd=repo or Path.cwd(), prompt=prompt, logdir=d,
+                     name=ask_id, web=a.web or a.research, timeout_min=a.timeout or (30 if a.research else 10))
+    claude = claude_snapshot(repo)
+    entry = {"id": ask_id, "at": now_iso(), "question": clip(question, 200), "research": a.research, "web": a.web or a.research,
+             "claude_session": (claude or {}).get("session_id"), "codex_start": codex_start,
+             **{k: rec.get(k) for k in ("model", "effort", "usage", "cost", "seconds", "thread", "error")}}
+    with open(d / "asks.jsonl", "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    footer = (f"— {a.model} · {a.effort}{' · web' if entry['web'] else ''} · "
+              f"{fmt_tok(rec['usage']['input_tokens'] + rec['usage']['output_tokens'])} tok · ≈${rec.get('cost') or 0:.2f} · {fmt_secs(rec.get('seconds'))}")
+    if rec["final"] is None:
+        print(f"ask failed: {rec['error']}\n{footer}")
+        return 1
+    if a.research:
+        m = re.search(r"^## Summary\s*\n(.*?)(?=^## |\Z)", rec["final"], re.S | re.M)
+        summary = m.group(1).strip() if m else "\n".join(rec["final"].splitlines()[:25])
+        print(f"{summary}\n\nFull report: {d / (ask_id + '.final.md')}\n{footer}")
+    else:
+        print(f"{rec['final']}\n{footer}")
     return 0
 
 
@@ -1097,11 +1180,18 @@ def main(argv=None) -> int:
     p = sub.add_parser("report", help="tokens, API-equivalent cost and limit usage for this task")
     p.add_argument("runs", nargs="*")
     p.add_argument("--all", action="store_true")
+    p = sub.add_parser("ask", help="quick read-only consult: second opinion, lookup, or --research (web) report")
+    p.add_argument("question", help="the question, or - to read it from stdin")
+    p.add_argument("--model", default="luna", help="luna (default), sol, or a full model id")
+    p.add_argument("--effort", default="high", choices=EFFORTS)
+    p.add_argument("--web", action="store_true", help="enable live web search")
+    p.add_argument("--research", action="store_true", help="multi-source web research; full report to a file, summary printed")
+    p.add_argument("--timeout", type=int, help="minutes (default 10, research 30)")
     sub.add_parser("statusline", help="Claude Code statusLine command (reads session JSON on stdin)")
     sub.add_parser("doctor", help="check codex, login, git and statusline setup")
     a = ap.parse_args(argv)
     return {"check": cmd_check, "run": cmd_run, "steer": cmd_steer, "merge": cmd_merge, "clean": cmd_clean,
-            "report": cmd_report, "statusline": cmd_statusline, "doctor": cmd_doctor}[a.cmd](a)
+            "report": cmd_report, "ask": cmd_ask, "statusline": cmd_statusline, "doctor": cmd_doctor}[a.cmd](a)
 
 
 if __name__ == "__main__":

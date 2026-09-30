@@ -42,6 +42,21 @@ st["calls"] += 1
 print(json.dumps({"type": "thread.started", "thread_id": thread}))
 print(json.dumps({"type": "turn.started"}))
 
+if schema is None:  # orc ask: plain-text answer that echoes how it was called
+    model = opt("-m")
+    effort = next(a.split("=", 1)[1].strip('"') for a in args if a.startswith("model_reasoning_effort="))
+    web = 'web_search="live"' in args
+    info = f"model={model} effort={effort} web={web}"
+    if "## Disagreements and uncertainty" in prompt:
+        final = f"## Summary\n- fake research finding ({info})\n\n## Details\nlong details\n\n## Sources\n1. https://example.com\n"
+    else:
+        final = f"fake answer ({info})"
+    Path(out).write_text(final)
+    print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5000, "cached_input_tokens": 1000,
+                                                           "output_tokens": 500, "reasoning_output_tokens": 200}}))
+    state.write_text(json.dumps(st))
+    sys.exit(0)
+
 if schema.endswith("verdict.schema.json"):
     verdict = "pass"
     if "FAKE_FAIL_VERIFY_ONCE" in prompt and not st["verifier_failed"]:
