@@ -92,7 +92,7 @@ def tail(text: str, lines: int = 25) -> str:
 
 
 def write_json(path: Path, data) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")  # unique: parallel writers
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
 
