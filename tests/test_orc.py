@@ -1,5 +1,6 @@
 """End-to-end tests for bin/orc against tests/fake_codex.py. Run: python3 -m unittest discover tests"""
 import json
+import argparse
 import copy
 import io
 import os
@@ -120,10 +121,10 @@ class OrcTest(unittest.TestCase):
         p = self.orc("run", "plan.toml")
         out = p.stdout
         self.assertEqual(p.returncode, 0, out + p.stderr)
-        self.assertIn("✓ scout [explorer·medium] done", out)
-        self.assertIn("✓ impl-a [implementer·medium] verified", out)   # repaired after failing check
-        self.assertIn("✓ impl-b [implementer·medium] verified", out)   # repaired after failing verifier
-        self.assertIn("✓ impl-c [implementer·medium] checks-passed", out)
+        self.assertIn("✓ scout [explorer·sol·medium] done", out)
+        self.assertIn("✓ impl-a [implementer·sol·medium] verified", out)   # repaired after failing check
+        self.assertIn("✓ impl-b [implementer·sol·medium] verified", out)   # repaired after failing verifier
+        self.assertIn("✓ impl-c [implementer·sol·medium] checks-passed", out)
         self.assertIn("orc merge", out)
         run_dir = next((self.repo / ".orc" / "runs").iterdir())
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
@@ -150,7 +151,7 @@ class OrcTest(unittest.TestCase):
 
         p = self.orc("report")
         rep = p.stdout
-        self.assertIn("| impl-a | implementer · medium | verified (merged) | 3 |", rep)
+        self.assertIn("| impl-a | implementer · sol · medium | verified (merged) | 3 |", rep)
         self.assertIn("**Codex (gpt-6.1-sol, ChatGPT plan):** 9 calls", rep)
         self.assertIn("5h 20% → 26%", rep)                      # Claude window delta
         self.assertIn("13k tokens (11k cache reads, 500 output)", rep)  # dedup of repeated message lines
@@ -1477,6 +1478,297 @@ class OrcTest(unittest.TestCase):
         with open(asks / "asks.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps({"id": "bad", "root": [], "question": [1]}) + "\n")
         self.assertEqual(self.orc("show").returncode, 0)
+
+
+    def test_feedback_plan_shapes_are_rejected_before_execution(self):
+        valid = 'goal="x"\n[[task]]\nid="x"\nrole="reviewer"\nwhy="x"\nbrief="x"\n'
+        cases = ['goal=42\n', 'goal="x"\n[task]\nid="x"\n', 'goal="x"\ndefaults=[]\n',
+                 valid.replace('brief="x"', 'brief=42'), valid.replace('role="reviewer"', 'role=["reviewer"]'),
+                 valid.replace('id="x"', 'id=42'), valid + 'checks="py -m unittest"\n',
+                 valid + 'web="false"\n', valid + 'acceptance=[42]\n', valid + 'deps=["mcp"]\n']
+        for body in cases:
+            with self.subTest(body=body):
+                p = self.orc("check", self.plan("invalid.toml", body))
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn("plan is invalid", p.stdout)
+                self.assertNotIn("Traceback", p.stderr)
+
+    def test_feedback_bare_check_and_invalid_git_base(self):
+        p = self.orc("check")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("Codex:", p.stdout)
+        self.assertIn("Claude:", p.stdout)
+        p = self.orc("check", self.review_plan(extra='base="missing-base"'))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("existing commit", p.stdout)
+
+    def test_feedback_merge_refuses_ungated_commit_and_changed_spec(self):
+        self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
+        rid, st = self.state()
+        wt = Path(st["tasks"]["base"]["worktree"])
+        (wt / "unverified.txt").write_text("not checked")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+        subprocess.run(["git", "commit", "-qm", "ungated"], cwd=wt, check=True)
+        for args in ((), ("base",)):
+            p = self.orc("merge", rid, *args)
+            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+            self.assertIn("differs from the passing gates", p.stdout)
+        self.assertFalse((self.repo / "unverified.txt").exists())
+        self.assertEqual(self.orc("steer", rid, "base", "recheck current code").returncode, 0)
+        saved_plan = self.repo / ".orc" / "runs" / rid / "plan.toml"
+        saved_plan.write_text(saved_plan.read_text().replace('acceptance = ["ok"]', 'acceptance = ["different spec"]'))
+        self.assertEqual(self.orc("merge", rid).returncode, 1)
+
+    def test_feedback_merge_and_clean_obey_mutation_lock_and_active_worker(self):
+        self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
+        rid, st = self.state()
+        run_dir = self.repo / ".orc" / "runs" / rid
+        mod = runpy.run_path(ORC[1])
+        for lock in (run_dir / "command.lock", self.repo / ".orc" / "locks" / "integration.lock"):
+            with mod["file_lock"](lock):
+                for command in ("merge", "clean"):
+                    p = self.orc(command, rid)
+                    self.assertNotEqual(p.returncode, 0)
+                    self.assertIn("another operation", p.stderr)
+        st["tasks"]["base"].update(status="running", pid=os.getpid())
+        (run_dir / "state.json").write_text(json.dumps(st))
+        for command in ("merge", "clean"):
+            p = self.orc(command, rid)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("active worker", p.stderr)
+        self.assertTrue(Path(st["tasks"]["base"]["worktree"]).exists())
+
+    def test_feedback_steer_amendments_reach_fresh_verifiers(self):
+        self.assertEqual(self.orc("run", self.review_plan(verify="codex")).returncode, 0)
+        rid, _ = self.state()
+        p = self.orc("steer", rid, "base", "require host and project_dir", "--allow-file", "client.py",
+                     "--acceptance", "host and project_dir are required")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        _, st = self.state()
+        rec = st["tasks"]["base"]
+        self.assertEqual(rec["amendments"][0]["message"], "require host and project_dir")
+        self.assertEqual(rec["extra_files"], ["client.py"])
+        for call in rec["calls"]:
+            if call["name"].startswith("verifier") and call != rec["calls"][1]:
+                prompt = (self.repo / ".orc" / "runs" / rid / "base" / (call["name"] + ".prompt.md")).read_text()
+                self.assertIn("Binding specification amendments", prompt)
+                self.assertIn("require host and project_dir", prompt)
+                self.assertIn("host and project_dir are required", prompt)
+        self.assertEqual(self.orc("merge", rid).returncode, 0)
+
+    def test_feedback_session_paths_and_reset_windows(self):
+        mod = runpy.run_path(ORC[1])
+        newer_window = mod["fmt_windows"]({"5h": (90, 4102462800)}, {"5h": (80, 4102444800)})
+        self.assertIn("window reset", newer_window)
+        self.assertNotIn("→", newer_window)
+        self.assertNotIn("window reset", mod["fmt_windows"]({"5h": (90, 4102444805)}, {"5h": (80, 4102444800)}))
+        project = self.repo.as_posix().upper() if os.name == "nt" else self.repo.as_posix()
+        self.orc("statusline", stdin=json.dumps({"session_id": "paths", "workspace": {"project_dir": project}}))
+        with patch.dict(os.environ, self.env):
+            mod = runpy.run_path(ORC[1])
+        self.assertEqual(mod["claude_snapshot"](self.repo)["session_id"], "paths")
+        self.assertIsNone(mod["claude_snapshot"](self.repo.with_name("repo-neighbor")))
+
+    def test_feedback_repeated_checks_preserve_an_intermittent_failure(self):
+        plan = self.review_plan(extra="checks_repeat=3")
+        with open(self.repo / plan, "a") as f:
+            f.write('max_repairs=0\nchecks=["n=$(cat counter 2>/dev/null || echo 0); n=$((n+1)); echo $n > counter; test $n -ne 2"]\n')
+        p = self.orc("run", plan)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        _, st = self.state()
+        rec = st["tasks"]["base"]
+        self.assertEqual(rec["status"], "failed")
+        self.assertEqual([c["attempt"] for c in rec["checks"]], [1, 1, 2, 2, 3, 3])
+        self.assertEqual(sum(c["exit"] != 0 for c in rec["checks"]), 1)
+        self.assertNotIn("gate", rec)
+
+    def test_feedback_summary_continuation_starts_a_fresh_thread(self):
+        self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
+        old, first = self.state()
+        self.assertEqual(self.orc("merge", old).returncode, 0)
+        plan = self.review_plan()
+        with open(self.repo / plan, "a") as f:
+            f.write(f'continues="{old}/base"\ncontinues_mode="summary"\n')
+        p = self.orc("run", plan)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        new, st = self.state()
+        self.assertNotEqual(st["tasks"]["base"]["calls"][0]["thread"], first["tasks"]["base"]["calls"][0]["thread"])
+        prompt = (self.repo / ".orc" / "runs" / new / "base" / "worker.prompt.md").read_text()
+        self.assertIn("fresh thread", prompt)
+        self.assertIn("fake worker", prompt)
+
+    def test_feedback_timeout_terminates_launcher_descendants(self):
+        marker, ready = self.tmp / "survived", self.tmp / "child-ready"
+        child = self.tmp / "slow.py"
+        child.write_text(f'import time\nfrom pathlib import Path\nPath({str(ready)!r}).touch()\ntime.sleep(1.5)\nPath({str(marker)!r}).touch()\n')
+        mod = runpy.run_path(ORC[1])
+        wrapper = self.tmp / "parent.py"
+        wrapper.write_text(f'import subprocess,time,sys\nsubprocess.Popen([sys.executable,{str(child)!r}])\ntime.sleep(30)\n')
+        launcher = codex_bin(wrapper) if os.name == "nt" else sys.executable
+        argv = [launcher] if os.name == "nt" else [launcher, str(wrapper)]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            mod["run_argv"](argv, timeout=0.8, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.assertTrue(ready.exists(), "child must have started to prove tree termination")
+        time.sleep(1.8)
+        self.assertFalse(marker.exists(), "a descendant survived the deadline")
+
+    def test_launcher_exit_terminates_children_holding_output_pipes(self):
+        mod = runpy.run_path(ORC[1])
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed):
+                ready = self.tmp / f"ready-{streamed}"
+                survived = self.tmp / f"survived-{streamed}"
+                child = self.tmp / f"child-{streamed}.py"
+                child.write_text(
+                    f'import time\nfrom pathlib import Path\n'
+                    f'Path({str(ready)!r}).touch()\ntime.sleep(1.5)\n'
+                    f'Path({str(survived)!r}).touch()\ntime.sleep(30)\n')
+                parent = self.tmp / f"launcher-{streamed}.py"
+                parent.write_text(
+                    f'import subprocess,sys,time\nfrom pathlib import Path\n'
+                    f'subprocess.Popen([sys.executable,{str(child)!r}])\n'
+                    f'while not Path({str(ready)!r}).exists(): time.sleep(0.01)\n'
+                    'print("launcher finished",flush=True)\n'
+                    'print("launcher stderr",file=sys.stderr,flush=True)\n')
+                argv = [codex_bin(parent)] if os.name == "nt" else [sys.executable, str(parent)]
+                lines = []
+                options = ({"line_handler": lines.append, "stderr": subprocess.PIPE} if streamed
+                           else {"capture_output": True})
+                result = mod["run_argv"](argv, text=True, timeout=5, **options)
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("launcher finished", "".join(lines) if streamed else result.stdout)
+                self.assertIn("launcher stderr", result.stderr)
+                self.assertTrue(ready.exists(), "child must start before the launcher exits")
+                time.sleep(1.8)
+                self.assertFalse(survived.exists(), "child survived launcher completion")
+
+    def test_feedback_research_limits_progress_and_event_timestamps(self):
+        p = self.orc("ask", "--research", "--depth", "quick", "one narrow question")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("deadline 3m", p.stderr)
+        ask = self.asks()[-1]
+        d = self.repo / ".orc" / "asks"
+        events = [json.loads(line) for line in (d / (ask["id"] + ".events.jsonl")).read_text().splitlines()]
+        self.assertTrue(events)
+        self.assertTrue(all("orc_received_at" in event for event in events))
+        self.assertEqual(json.loads((d / (ask["id"] + ".progress.json")).read_text())["status"], "done")
+        self.assertIn("do not crawl repositories", (d / (ask["id"] + ".prompt.md")).read_text())
+        self.assertEqual(self.orc("ask", "--continue", ask["id"], "follow up").returncode, 0)
+        self.assertEqual(self.asks()[-1]["depth"], "quick")
+        for args in (("--timeout", "0"), ("--timeout", "-1"), ("--max-tools", "0"), ("--depth", "quick")):
+            self.assertNotEqual(self.orc("ask", *args, "q").returncode, 0)
+
+    def test_feedback_observed_tool_budget_stops_a_live_process(self):
+        self.fake_script('''
+            import json,sys,time
+            prompt=sys.stdin.read()
+            for i in range(2):
+                print(json.dumps({"type":"item.started","item":{"id":str(i),"type":"command_execution","command":"true"}}),flush=True)
+            time.sleep(30)
+        ''')
+        started = time.monotonic()
+        p = self.orc("ask", "--max-tools", "1", "q")
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("tool budget exceeded", p.stdout)
+        self.assertIn("tool budget exceeded", self.asks()[-1]["error"])
+
+    def test_feedback_report_includes_history_without_a_session(self):
+        for i in range(2):
+            self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
+        p = self.orc("report", "--calls")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("project history · 2 run(s)", p.stdout)
+        self.assertEqual(p.stdout.count("| base |"), 2)
+        self.assertIn("implementer · sol · medium", p.stdout)
+        self.assertIn("output tok/min", p.stdout)
+        self.assertNotIn("limits n/a |", p.stdout)
+        self.assertIn("0 run(s)", self.orc("report", "--since", "2099-01-01").stdout)
+        self.assertEqual(self.orc("report", "--since", "not-a-date").returncode, 2)
+
+    def test_report_of_explicit_runs_omits_another_sessions_claude_usage(self):
+        self.orc("statusline", stdin=json.dumps({"session_id": "s1", "workspace": {"project_dir": str(self.repo)}}))
+        self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
+        run_id = next((self.repo / ".orc" / "runs").iterdir()).name
+        self.assertIn("**Claude (", self.orc("report", run_id).stdout)
+        self.orc("statusline", stdin=json.dumps({"session_id": "s2", "workspace": {"project_dir": str(self.repo)}}))
+        rep = self.orc("report", run_id).stdout
+        self.assertNotIn("**Claude (", rep)
+        self.assertIn("not started from this Claude session", rep)
+
+    def test_feedback_post_merge_smoke_failure_is_recorded(self):
+        self.assertEqual(self.orc("run", self.review_plan(extra='post_merge_checks=["false"]')).returncode, 0)
+        rid, _ = self.state()
+        p = self.orc("merge", rid)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("merged commits remain", p.stdout)
+        _, st = self.state()
+        self.assertTrue(st["tasks"]["base"]["merged"])
+        self.assertEqual(st["post_merge_checks"][0]["exit"], 1)
+        self.assertTrue((self.repo / ".orc" / "runs" / rid / "post-merge-checks.log").exists())
+        self.assertEqual(self.orc("merge", rid).returncode, 2, "failed smoke checks must rerun even without a new merge")
+        self.assertIn("0/1 passed", self.orc("report").stdout)
+        self.assertIn("0/1 passed", self.orc("show", rid).stdout)
+
+    def test_feedback_locked_commands_keep_the_resolved_latest_run(self):
+        self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
+        with patch.dict(os.environ, self.env):
+            mod = runpy.run_path(ORC[1])
+        original = mod["find_run"]
+        for command in ("cmd_merge", "cmd_clean"):
+            lookups = []
+            def find(repo, ref):
+                lookups.append(ref)
+                self.assertLessEqual(lookups.count(None), 1, "latest target was resolved again after locking")
+                return original(repo, ref)
+            with patch.dict(mod[command].__globals__, repo_root=lambda: self.repo, find_run=find):
+                self.assertEqual(mod[command](argparse.Namespace(run=None, tasks=[])), 0)
+            self.assertEqual(lookups.count(None), 1)
+
+    def test_feedback_repair_ownership_gap_is_blocked(self):
+        self.fake_script(f'''
+            import json,sys,runpy
+            from pathlib import Path
+            args=sys.argv
+            if "--output-schema" in args and args[args.index("--output-schema")+1].endswith("verdict.schema.json"):
+                sys.stdin.read()
+                verdict={{"verdict":"fail","summary":"root cause is outside ownership","criteria":[],
+                          "issues":[{{"severity":"major","location":"README:1","problem":"fix the root cause"}}]}}
+                Path(args[args.index("-o")+1]).write_text(json.dumps(verdict))
+                print(json.dumps({{"type":"thread.started","thread_id":"verifier"}}))
+                print(json.dumps({{"type":"turn.completed","usage":{{}}}}))
+            else:
+                runpy.run_path({str(ROOT / "tests" / "fake_codex.py")!r},run_name="__main__")
+        ''')
+        plan = self.review_plan(verify="codex")
+        with open(self.repo / plan, "a") as f:
+            f.write('files=["base.txt"]\n')
+        p = self.orc("run", plan)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        rid, st = self.state()
+        rec = st["tasks"]["base"]
+        self.assertEqual(rec["status"], "blocked")
+        self.assertEqual(rec["needs_files"], ["README"])
+        self.assertEqual(len(rec["calls"]), 2, "do not spend a futile automatic repair round")
+        self.orc("steer", rid, "base", "fix README", "--allow-file", "README")
+        _, st = self.state()
+        self.assertEqual(st["tasks"]["base"]["status"], "failed")
+        self.assertNotIn("needs_files", st["tasks"]["base"])
+
+    def test_feedback_commands_can_be_read_without_changing_directories(self):
+        self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
+        rid, _ = self.state()
+        event_path = self.repo / ".orc" / "runs" / rid / "base" / "worker.events.jsonl"
+        with open(event_path, "a") as f:
+            f.write(json.dumps({"type":"item.completed","orc_received_at":"2026-10-01T00:00:00Z",
+                               "item":{"type":"command_execution","command":"py -m unittest","exit_code":0,"aggregated_output":"passed"}}) + "\n")
+        p = self.orc("show", f"{rid}/base", "--commands")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("py -m unittest [exit 0]", p.stdout)
+        self.assertIn("passed", p.stdout)
+        self.assertIn('"orc_received_at"', self.orc("show", f"{rid}/base", "--events").stdout)
+        self.assertNotEqual(self.orc("show", "--events").returncode, 0)
+
 
 
 class PackagingTest(unittest.TestCase):

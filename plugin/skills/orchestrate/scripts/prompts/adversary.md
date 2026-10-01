@@ -4,4 +4,6 @@ Run `git diff {base}` to see the change. Attack the design and the implementatio
 
 Report only issues with a concrete failure scenario. If you genuinely cannot break it, return "pass" and list what you tried in `summary`.
 
+Treat the brief's binding rules, shared decisions and specification amendments as requirements, not just acceptance examples. Later amendments override conflicting earlier requirements. Attack mocked OS/API assumptions and timing-dependent tests where relevant; report what could not be exercised live.
+
 Your final message must be JSON matching the provided schema. Use `criteria` for the attacks you tried, with met = "yes" when the change survived that attack.
