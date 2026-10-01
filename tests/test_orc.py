@@ -1612,6 +1612,36 @@ class OrcTest(unittest.TestCase):
         time.sleep(1.8)
         self.assertFalse(marker.exists(), "a descendant survived the deadline")
 
+    def test_launcher_exit_terminates_children_holding_output_pipes(self):
+        mod = runpy.run_path(ORC[1])
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed):
+                ready = self.tmp / f"ready-{streamed}"
+                survived = self.tmp / f"survived-{streamed}"
+                child = self.tmp / f"child-{streamed}.py"
+                child.write_text(
+                    f'import time\nfrom pathlib import Path\n'
+                    f'Path({str(ready)!r}).touch()\ntime.sleep(1.5)\n'
+                    f'Path({str(survived)!r}).touch()\ntime.sleep(30)\n')
+                parent = self.tmp / f"launcher-{streamed}.py"
+                parent.write_text(
+                    f'import subprocess,sys,time\nfrom pathlib import Path\n'
+                    f'subprocess.Popen([sys.executable,{str(child)!r}])\n'
+                    f'while not Path({str(ready)!r}).exists(): time.sleep(0.01)\n'
+                    'print("launcher finished",flush=True)\n'
+                    'print("launcher stderr",file=sys.stderr,flush=True)\n')
+                argv = [codex_bin(parent)] if os.name == "nt" else [sys.executable, str(parent)]
+                lines = []
+                options = ({"line_handler": lines.append, "stderr": subprocess.PIPE} if streamed
+                           else {"capture_output": True})
+                result = mod["run_argv"](argv, text=True, timeout=5, **options)
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("launcher finished", "".join(lines) if streamed else result.stdout)
+                self.assertIn("launcher stderr", result.stderr)
+                self.assertTrue(ready.exists(), "child must start before the launcher exits")
+                time.sleep(1.8)
+                self.assertFalse(survived.exists(), "child survived launcher completion")
+
     def test_feedback_research_limits_progress_and_event_timestamps(self):
         p = self.orc("ask", "--research", "--depth", "quick", "one narrow question")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)

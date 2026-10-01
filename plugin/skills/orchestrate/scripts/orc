@@ -215,12 +215,22 @@ def managed_run(cmd, *, input=None, timeout=None, capture_output=False, check=Fa
         kw["creationflags"] = kw.get("creationflags", 0) | 0x4 | subprocess.CREATE_NO_WINDOW  # CREATE_SUSPENDED
     else:
         kw["start_new_session"] = True
-    p, reader, errors = None, None, []
+    p, reader, reaper, errors = None, None, None, []
     try:
         p = subprocess.Popen(cmd, **kw)
         if job:
             p._orc_job = job
             job.attach_and_resume(p)
+        # Pipe EOF may depend on descendants, so reap them independently of
+        # communicate(). Preserve the launcher's exit status and buffered output.
+        def reap_descendants():
+            try:
+                p.wait()
+                stop_process(p)
+            except Exception as e:
+                errors.append(e)
+        reaper = threading.Thread(target=reap_descendants, daemon=True)
+        reaper.start()
         if line_handler:
             pipe, p.stdout = p.stdout, None  # communicate owns stdin/stderr; reader owns stdout
             def read_lines():
@@ -239,8 +249,7 @@ def managed_run(cmd, *, input=None, timeout=None, capture_output=False, check=Fa
             stop_process(p)
             p.communicate()
             raise
-        # Do not leave background tool processes alive after a call returns.
-        stop_process(p)
+        reaper.join()
         if reader:
             reader.join()
         if errors:
@@ -257,6 +266,8 @@ def managed_run(cmd, *, input=None, timeout=None, capture_output=False, check=Fa
             else:
                 stop_process(p)
             p.wait()
+        if reaper:
+            reaper.join()
         if job:
             job.close()
         if reader:
