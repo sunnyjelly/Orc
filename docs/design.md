@@ -12,7 +12,7 @@
 
 ```
 Claude Code (desktop) — Opus 5.5 lead
-  plugin "orc": skill orchestrate (SKILL.md ≈90 lines; 2 reference files loaded on demand) + skill delegate
+  plugin "orc": skill orchestrate (SKILL.md ≈90 lines; 3 reference files loaded on demand) + skill delegate
   statusLine → `python3 ~/.orc/app/orc statusline` (installed by `orc setup`) ──► ~/.orc/claude/<session>.json  (cost, limits, transcript path)
   Bash ──► orc check | run (background) | steer | merge | report | ask [--continue] | show
                  │
@@ -65,9 +65,9 @@ The repo is a Claude Code plugin marketplace: `.claude-plugin/marketplace.json` 
 | Role | Sandbox | Effort | Where | Verification default |
 |---|---|---|---|---|
 | explorer | read-only | medium | repo root | none; the lead spot-checks key claims |
-| reviewer | read-only | high | repo root | none |
-| implementer | workspace-write | high | own worktree, branch `orc/<run>/<task>` | from `risk`: low → checks, medium → checks + verifier, high → checks + verifier + adversary |
-| verifier (internal) | read-only | high | implementer's worktree | fresh thread every round |
+| reviewer | read-only | medium for Sol; high otherwise | repo root | none |
+| implementer | workspace-write | medium for Sol; high otherwise | own worktree, branch `orc/<run>/<task>` | from `risk`: low → checks, medium → checks + verifier, high → checks + verifier + adversary |
+| verifier (internal) | read-only | medium for Sol; high otherwise | implementer's worktree | fresh thread every round |
 | adversary (internal) | read-only | xhigh | implementer's worktree | fresh thread |
 
 ## Consults (`orc ask`)
@@ -77,7 +77,7 @@ A consult is a single read-only Codex call that runs in the foreground, with no 
 - **Quick lookup**: `--web` turns on Codex live web search (`-c web_search="live"`).
 - **Deep research**: `--research`. A research preamble makes one agentic call search, cross-check and write a cited Markdown report to `.orc/asks/<id>.final.md`. The lead gets only the `## Summary` section and the file path.
 
-The default model is **GPT-6.1 Sol at high effort**, the preferred model everywhere. `--model luna` (GPT-6 Luna, about 20× cheaper per token) is opt-in for simple lookups; use it at high effort, since Luna at low effort is too weak to be useful. Luna is never used for implementation or verification.
+The default model is **GPT-6.1 Sol at medium effort**, the preferred model everywhere. `--model luna` (GPT-6 Luna, about 20× cheaper per token) is opt-in for simple lookups; use it at high effort, since Luna at low effort is too weak to be useful. Luna is never used for implementation or verification. Explicit task and plan effort settings override the model default; ask continuations retain their previous effort. The adversary still uses xhigh.
 
 Deep research is a flag on `ask`, not a plan feature. Research needs no worktrees, checks or merges, and one agentic call already runs many searches. For broad research that splits into independent areas, a plan with several `web = true` explorers does it in parallel.
 
@@ -85,7 +85,7 @@ Each consult is appended to `.orc/asks/asks.jsonl` with its usage and cost. `orc
 
 ## Follow-ups and history
 
-Every Codex call keeps its thread, and each run or ask records the thread id, so earlier work can be continued warm instead of re-explained. A warm resume is several times cheaper than a cold worker re-reading the code (research/findings.md).
+Every Codex call keeps its thread, and each run or ask records the thread id, so earlier work can be continued warm instead of re-explained. Warm resumes can preserve useful context and cache, but long histories can become more expensive. Use `continues_mode = "summary"` to seed a fresh thread with the earlier final result when inherited detail no longer earns its cost.
 
 - **Ask follow-ups**: `orc ask --continue <ask-id|last> "…"` resumes the ask's thread with only the new question. It keeps the ask's model, effort and web or research mode unless overridden. Research follow-ups keep the report format and still print only the summary. Each ask records `parent` and `root`, so a conversation can be replayed, and the footer prints the ask id. `last` means this Claude session's newest ask (any session's only when no session is known).
 - **Questions to a worker**: `orc ask --continue <run>/<task> "…"` resumes a task's own thread (never a verifier's) read-only, with no output schema. Each worker records its actual `cwd`, including a reviewer or explorer using an implementer dependency’s worktree. Questions use that checkout while it exists, then fall back to the repo; older records resolve the dependency from the plan. The prompt says where the worker's changes are. A follow-up to such a question stays a question to that worker. `--web` and `--research` are refused here, and web search stays off even if the worker's task had it, so a question never adds web pages to a worker's thread.
@@ -120,7 +120,7 @@ Quota is checked after acquiring a Codex process slot, and the completed call's 
 - **Claude tokens**: assistant-message usage in the session transcript and its `subagents/*.jsonl`, deduplicated by message id and request id.
 - **Claude cost**: `cost.total_cost_usd` from the status line, which Claude Code computes at list price. It falls back to `pricing.toml`.
 - **Claude limit %**: `rate_limits.five_hour` / `seven_day` from the status line. The first value seen in the session is kept, so the report shows start → now.
-- **Scope**: `orc report` covers every run started from the current Claude session (matched by session id), plus the whole Claude session. That fits the intended pattern of one task per conversation.
+- **Scope**: `orc report` covers every run started from the current Claude session (matched by session id), plus the whole Claude session. Without a matching session snapshot, all project history is included and clearly labeled. Explicit run IDs, `--all`, `--since` and `--calls` control scope and detail.
 
 ## Assumptions to verify on the first real run
 
@@ -178,3 +178,16 @@ Rules to follow if this is built:
   - quote the source for key claims
 - **Report source use.** Count the `mcp_tool_call` events in the summary (e.g. `sources: context7 ×3, github ×2, web ×5`) and flag refused calls, so the lead can see thin evidence.
 - **Check the servers.** Have `orc doctor` start each configured source and confirm it responds. It also needs to confirm that MCP servers have network access while the worker runs `-s read-only`.
+
+## Field-feedback fixes
+
+- **Gate identity:** successful gates persist the tested commit/base and a fingerprint of the task, goal, context and amendments. Merge refuses a moved branch or changed spec, and merges the resolved commit. Old successful records without gate identity must be rechecked.
+- **Mutation serialization:** merge and clean share the run command lock and a repository integration lock. The resolved run stays fixed while locked, including when using the latest-run default. Active workers prevent cleanup/merge.
+- **Process ownership:** Windows children launch suspended, join a kill-on-close Job Object, then resume; POSIX calls get their own process group. Deadlines, cancellation and completed calls terminate descendants before ownership is released.
+- **Full specifications:** persisted steer amendments reach workers, verifiers and adversaries, with later amendments overriding conflicts. Explicit acceptance replacements and file extensions survive reload. Out-of-ownership root-cause findings become blocked, avoiding futile automatic repair rounds.
+- **Preflight:** known field names/types are validated before normalization, and check verifies an implementer's Git base. Bare check prints usage limits without writing state. Windows session matching normalizes paths; quota reports compare reset metadata, not only percentages.
+- **Research:** quick/standard/deep default to 3/10/30 minutes and 12/40/100 observed tool calls. These are time/activity bounds, not token or quota predictions. Events stream with receipt timestamps, progress files and a 30-second stderr heartbeat. Hitting a limit can leave partial events instead of a final answer.
+- **Integration:** checks_repeat preserves failures across all repetitions. Explicit post_merge_checks run on the lead host in the merged checkout; failure returns 2, records logs and preserves commits. A subsequent merge retries failed smoke checks even if there is nothing new to merge.
+- **Observability:** report labels its scope, shows task models, and optionally prints per-call rates/quota snapshots. show supports task events and commands without changing cwd.
+
+Windows dependency provisioning, read-only scratch support, and multi-parent integration remain separate features; this update documents the existing limitations rather than weakening sandbox boundaries or silently installing dependencies. See `plugin/skills/orchestrate/reference/execution.md`.

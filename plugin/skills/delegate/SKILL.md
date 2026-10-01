@@ -1,6 +1,7 @@
 ---
 name: delegate
 description: Decide whether and how to use subagents for a task, by doing it yourself, handing it to one subagent, or running a small team, and verify delegated work with a subagent that did not do it. Use when a task is large, splits into independent parts or is high-stakes, or when the user asks for subagents, parallel work or a second opinion.
+license: MIT
 compatibility: Any Claude environment with subagents, such as Claude Code's Agent tool (local or cloud sessions). Guidance only; no scripts. If the `orchestrate` skill (orc, Codex workers) is available, use it for the mechanics.
 ---
 

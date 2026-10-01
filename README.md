@@ -1,10 +1,10 @@
 # orc: Claude leads, Codex works
 
-Claude Code (Opus 5.5) acts as the lead engineer. It delegates work to OpenAI Codex workers (GPT-6.1 Sol) that run on your ChatGPT subscription, and every change is checked by a verifier that did not write it. At the end you get one report: tokens, API-equivalent cost, and 5-hour/weekly limit usage for both Claude and Codex.
+Claude Code acts as the lead engineer. It delegates work to OpenAI Codex workers that run on your ChatGPT subscription, and every change is checked by a verifier that did not write it. At the end you get one report: tokens, API-equivalent cost, and 5-hour/weekly limit usage for both Claude and Codex.
 
 ```
-you ──► Opus 5.5 (lead, skill "orchestrate")
-          ├─ `orc ask`: second opinion · web lookup · --research   (Sol 6.1 high by default; Luna optional)
+you ──► Claude (lead, skill "orchestrate")
+          ├─ `orc ask`: second opinion · web lookup · --research   (strong Codex model by default; a cheaper one optional)
           ├─ triage: solo │ one worker │ team of 2–4   (portable version: skill "delegate")
           ├─ plan.toml ──► `orc check`  → plan table for you to approve
           ├─ `orc run` (one background call)
@@ -23,7 +23,7 @@ you ──► Opus 5.5 (lead, skill "orchestrate")
 
 | Piece | What it is | Where it works |
 |---|---|---|
-| **`orchestrate` skill** | Opus leads, Codex workers do the work through the bundled `orc` CLI | Claude Code on your machine (desktop app or CLI), with Codex signed in |
+| **`orchestrate` skill** | Claude leads, Codex workers do the work through the bundled `orc` CLI | Claude Code on your machine (desktop app or CLI), with Codex signed in |
 | **`delegate` skill** | Portable guidance on when and how to use subagents (triage, briefs, independent verification). No scripts. | Anywhere Claude has subagents, including Claude Code cloud sessions |
 
 Both ship together as one Claude Code plugin, and each is also a standalone `.skill` file in [`dist/`](dist/).
@@ -60,11 +60,11 @@ Download a `.skill` file from [`dist/`](dist/). It is a zip of the skill folder.
 
 - Python 3.11+ and git
 - the Codex CLI signed in with a ChatGPT plan that includes Codex
-- Claude Code; Opus 5.5 at medium or high effort works well as the lead
+- Claude Code; use the strongest Claude model available at medium or high effort as the lead
 
 ## Use
 
-Open any git repo in Claude Code and ask for work as usual. Set the model to Opus 5.5 at medium or high effort. The `orchestrate` skill makes Opus:
+Open any git repo in Claude Code and ask for work as usual. Use the strongest Claude model available at medium or high effort. The `orchestrate` skill makes Claude:
 
 1. **Triage.** Small or context-heavy work it does itself. Otherwise it plans one worker or a small team.
 2. **Plan.** It writes `.orc/plan.toml` and shows you `orc check`'s table: each task, its role and effort, dependencies, verification, and why it is delegated. It waits for your OK unless you told it to go ahead.
@@ -76,8 +76,8 @@ Open any git repo in Claude Code and ask for work as usual. Set the model to Opu
 | task | role · effort | result | calls | tokens in (cached) / out | ≈ API $ | time |
 | map-auth   | explorer · medium    | done     | 1 | 180k (120k) / 6k  | $0.19 | 2m10s |
 | rate-limit | implementer · high   | verified | 3 | 610k (450k) / 31k | $0.68 | 9m02s |
-**Codex (gpt-6.1-sol, ChatGPT plan):** 4 calls · 827k tokens … · ≈ $0.87 API-equivalent · 5h 12% → 31%, wk 40% → 43%
-**Claude (Opus 5.5, this session):** 1.9M tokens (1.7M cache reads, 38k output) · ≈ $2.40 API-equivalent · 5h 9% → 15%, wk 22% → 23%
+**Codex (<model>, ChatGPT plan):** 4 calls · 827k tokens … · ≈ $0.87 API-equivalent · 5h 12% → 31%, wk 40% → 43%
+**Claude (<model>, this session):** 1.9M tokens (1.7M cache reads, 38k output) · ≈ $2.40 API-equivalent · 5h 9% → 15%, wk 22% → 23%
 **Total ≈ $3.27 API-equivalent**
 ```
 
@@ -85,16 +85,16 @@ Open any git repo in Claude Code and ask for work as usual. Set the model to Opu
 
 | Command | What it does |
 |---|---|
-| `orc ask [--model sol\|luna] [--effort E] [--web] [--research] "Q"` | Quick read-only consult (default GPT-6.1 Sol at high effort): a second opinion, lookup, or web research. `--research` saves a cited report to `.orc/asks/` and prints only its summary. |
+| `orc ask [--model M] [--effort E] [--web] [--research] "Q"` | Quick read-only consult (default: the strong Codex model; `orc ask --help` lists models and efforts): a second opinion, lookup, or web research. `--research` saves a cited report to `.orc/asks/` and prints only its summary. |
 | `orc ask --continue ID\|last\|RUN/TASK "Q"` | Follow-up in an earlier thread: continues an ask conversation (same model and mode), or asks a finished worker about its work, read-only. Each ask's footer prints its id. |
 | `orc show [--grep TEXT] [-n N]` | Lists earlier runs (with task statuses) and ask conversations, newest first. |
 | `orc show RUN\|RUN/TASK\|ASK-ID` | Re-reads a run summary, a task's full result and thread id, or a whole ask conversation. |
-| `orc check PLAN` | Validates the plan (roles, acceptance criteria, file ownership, cycles) and prints the plan table, estimated Codex calls and current limits. No Codex calls. |
+| `orc check [PLAN]` | Without a plan, prints limits. With a plan, validates types, roles, acceptance, ownership, dependencies and the Git base, then prints the plan and call estimate. No Codex calls. |
 | `orc run PLAN [--only a,b]` | Runs the plan. Prints progress to stderr and a compact summary to stdout. Exit 0 if everything passed, 2 otherwise. |
 | `orc steer RUN TASK "msg"` | Follow-up on a task's own Codex thread (warm context), then re-check and re-verify. For more work after a task is merged, use `continues = "RUN/TASK"` on a task in a new plan instead. |
 | `orc merge [RUN] [TASK…]` | Merges verified branches (`--no-ff`) and removes clean worktrees once dependents no longer need them. Refuses stale dependencies or an existing Git operation; exits 1 at the first conflict. |
 | `orc clean [RUN]` | Removes a run's leftover worktrees and branches. |
-| `orc report [RUN…] [--all]` | Tokens, ≈ API cost and limit % for this Claude session's runs plus the session itself. |
+| `orc report [RUN…] [--all] [--since DATE] [--calls]` | Explicit scope, models, tokens, ≈ API cost and limit %. Without session detection, includes all project history; `--calls` adds per-call rates and quota snapshots. |
 | `orc resume [RUN]` | Runs a run's skipped tasks, e.g. after `steer` fixed the task they depend on. |
 | `orc setup [--force]` | Copies orc to `~/.orc/app` and sets Claude Code's status line to it. |
 | `orc statusline` | The status line command itself (reads Claude Code's session JSON on stdin). |
@@ -123,6 +123,8 @@ tests/                               end-to-end tests against a fake codex
 
 Run state goes to `<repo>/.orc/runs/` (git-excluded automatically). Worktrees, usage snapshots and the `orc setup` copy go to `~/.orc/`.
 
+Research supports `--depth quick|standard|deep` (3/10/30 minutes and 12/40/100 observed tool calls), with progress on stderr and in `.progress.json`. Override with `--timeout` / `--max-tools`. Steers reach verifiers as binding spec amendments; `--acceptance` replaces criteria and `--allow-file` extends ownership explicitly. Passing gates are bound to commits/specifications, and merge/clean are serialized with run mutations. Plan `checks_repeat` catches intermittent failures, and optional `post_merge_checks` exercises the combined result on the real host. Add `continues_mode = "summary"` for a fresh follow-up thread. Details and Windows dependency guidance: [execution.md](plugin/skills/orchestrate/reference/execution.md).
+
 ## Tests
 
 ```bash
@@ -142,3 +144,7 @@ The tests run against `tests/fake_codex.py`. They cover:
 - the quota guard
 - report scoping and setup
 - the packaged skills They have not yet run against real Codex; see the "Assumptions to verify" section in `docs/design.md`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

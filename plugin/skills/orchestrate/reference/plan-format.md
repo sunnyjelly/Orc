@@ -8,13 +8,15 @@ Decisions every worker must share: conventions, chosen approach, names, things n
 Workers see this, the goal, and a one-line list of the other tasks.
 """
 checks = ["npm test --silent", "npm run lint"]   # run in each implementer's worktree after it finishes
+checks_repeat = 1          # positive integer; repeat all worktree checks, preserving every failure
+post_merge_checks = ["npm run smoke"]  # optional host/integration commands in the main repo after merge
 max_parallel = 3           # positive integer: concurrent Codex processes (default 3)
 quota_stop = 90            # number > 0 and <= 100: stop new calls at this limit % (default 90)
 base = "HEAD"              # where worktrees branch from (default HEAD; commit your changes first)
 
 [defaults]                 # optional
 model = "gpt-6.1-sol"
-implementer_effort = "high"   # also explorer_effort, reviewer_effort
+implementer_effort = "medium" # also explorer_effort, reviewer_effort; Sol defaults to medium
 max_repairs = 1               # nonnegative integer: automatic repair rounds
 timeout_min = 30              # positive integer
 network = false               # let implementers use the network (e.g. package installs)
@@ -25,6 +27,7 @@ role = "explorer"          # explorer | reviewer (read-only) | implementer (writ
 model = "luna"             # optional: sol (default, gpt-6.1-sol) | luna (gpt-6-luna, cheap: simple scouting only) | full id
 web = true                 # optional, explorer/reviewer only: live web search
 continues = "20260930-101010/map-auth"   # optional: resume that earlier task's Codex thread; see below
+continues_mode = "thread"   # thread (default) | summary (fresh thread seeded with earlier final result)
 why = "Shown to the user and to other workers: why this task exists and why it is delegated"
 brief = """What to find or do. See briefs.md."""
 
@@ -42,7 +45,7 @@ files = ["src/auth/**", "tests/auth/**"]   # owned paths; required when implemen
 checks = ["pytest tests/auth -q"]          # added to the plan-level checks
 effort = "high"
 verify = "codex"           # none | checks | codex | codex+adversary (default from risk: low→checks, medium→codex, high→codex+adversary)
-verify_effort = "high"     # verifier reasoning effort (the adversary always uses xhigh)
+verify_effort = "medium"   # Sol verifier default; the adversary always uses xhigh
 ```
 
 Rules `orc check` enforces:
@@ -50,13 +53,15 @@ Rules `orc check` enforces:
 - Implementers that could run at the same time need disjoint `files`.
 - An implementer may build on at most one other implementer: it branches from that implementer's branch.
 - No dependency cycles.
+- Field types and supported names are validated; string-valued checks or unknown fields are errors.
+- Implementers require a Git repository with an existing base commit.
 
 How a task runs:
 - **explorer / reviewer**: one read-only Codex call in the repo. The summary includes its findings.
 - **implementer**:
   1. Codex works in its own worktree on branch `orc/<run>/<task>`.
   2. orc commits the result and runs the checks.
-  3. A fresh read-only verifier checks the acceptance criteria (plus an adversary at `codex+adversary`).
+  3. A fresh read-only verifier checks binding brief rules, shared decisions, acceptance criteria and steer amendments (plus an adversary at `codex+adversary`).
   4. If the checks or the verdict fail, orc resumes the implementer's own thread with the failures, up to `max_repairs` times, then re-checks with a fresh verifier.
 - Statuses:
   - `verified`: checks and verifier passed
@@ -76,3 +81,9 @@ How a task runs:
 - A failed worker, repair, or steer cannot pass on the strength of final JSON alone. Partial implementation work is committed for recovery. A verifier execution error produces `uncertain`, even if its final JSON says `pass`.
 - `resume` reuses a quota-skipped implementer's existing worktree and call history. Partial merges retain branches and worktrees while unfinished tasks still need them. Merge refuses to run during another Git operation and leaves dirty worktrees available for inspection.
 - Checks are POSIX shell (Git Bash on Windows). They run on your machine, outside Codex's sandbox, on code a worker wrote. Only use `checks` you would run yourself on an untrusted branch.
+
+`checks_repeat` can also be set in defaults or on a task (task overrides plan, plan overrides defaults). `post_merge_checks` is plan-level and opt-in. See [execution.md](execution.md) for Windows dependencies, read-only limitations, deadlines and smoke-check effects.
+
+`steer` messages are saved as specification amendments. Repeated `--acceptance "criterion"` replaces acceptance criteria; repeated `--allow-file path` extends ownership explicitly, refusing overlaps with tasks that can run in parallel. A verifier finding in an existing file outside the task's ownership becomes `blocked: repair needs file ownership` instead of consuming futile repair rounds.
+
+Passing gates are tied to the checked commit and specification. Merge refuses a changed branch tip/specification; recheck with `steer`. `continues_mode = "summary"` uses the earlier final result as contextual data in a fresh thread, without claiming the old thread. It does not bypass the web-to-writer restriction.
