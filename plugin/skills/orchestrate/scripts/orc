@@ -39,6 +39,7 @@ CODEX = shutil.which(CODEX) or CODEX  # Windows: npm installs codex.cmd, which C
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 
 DEFAULT_MODEL = "gpt-6.1-sol"
+DEFAULT_MODEL_EFFORT = "medium"
 # Short names the lead can use. Update when OpenAI ships newer versions (e.g. a 6.1 Luna).
 MODEL_ALIASES = {"sol": "gpt-6.1-sol", "luna": "gpt-6-luna"}
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
@@ -517,13 +518,15 @@ def load_plan(path: str) -> tuple[dict, list[str], list[str]]:
         t["web"] = bool(t.get("web", False))
         if t["web"] and t["writes"]:
             errs.append(f"{tid}: `web` is for explorer/reviewer tasks; research first, then implement")
-        t["effort"] = t.get("effort") or defaults.get(f"{role}_effort") or ROLES[role]["effort"]
+        t["effort"] = t.get("effort") or defaults.get(f"{role}_effort") or (
+            DEFAULT_MODEL_EFFORT if t["model"] == DEFAULT_MODEL else ROLES[role]["effort"])
         if t["effort"] not in EFFORTS:
             errs.append(f"{tid}: effort must be one of {', '.join(EFFORTS)}")
         t["verify"] = t.get("verify") or (VERIFY_BY_RISK[risk] if t["writes"] else "none")
         if t["verify"] not in VERIFY_LEVELS:
             errs.append(f"{tid}: verify must be one of {', '.join(VERIFY_LEVELS)}")
-        if t.get("verify_effort", "high") not in EFFORTS:
+        t["verify_effort"] = t.get("verify_effort", DEFAULT_MODEL_EFFORT if t["model"] == DEFAULT_MODEL else "high")
+        if t["verify_effort"] not in EFFORTS:
             errs.append(f"{tid}: verify_effort must be one of {', '.join(EFFORTS)}")
         t["acceptance"] = list(t.get("acceptance", []))
         if t["writes"] and not t["acceptance"]:
@@ -1438,14 +1441,15 @@ def cmd_run(a) -> int:
             if any(t["writes"] for t in plan["task"]) and not repo:
                 die("implementer tasks need a git repository")
             base = git("rev-parse", plan.get("base", "HEAD"), cwd=repo) if repo else None
-            run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            run_stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            run_id = run_stamp
             for n in range(2, 100):  # two runs in the same second get a suffix
                 run_dir = runs_dir(repo) / run_id
                 try:
                     run_dir.mkdir(parents=True)
                     break
                 except FileExistsError:
-                    run_id = f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{n}"
+                    run_id = f"{run_stamp}-{n}"
             (run_dir / "plan.toml").write_text(Path(a.plan).read_text(encoding="utf-8"), encoding="utf-8")
             codex_start = codex_limits()
             save_codex_limits(codex_start)
@@ -1775,7 +1779,8 @@ def cmd_ask(a) -> int:
     research = a.research or bool((src or {}).get("research"))
     web = (a.web or research or bool((src or {}).get("web"))) and not (src and src["kind"] == "task")
     model = resolve_model(a.model or (src or {}).get("model") or "sol")
-    effort = a.effort or (src["effort"] if src and src["kind"] == "ask" else None) or "high"
+    effort = a.effort or (src["effort"] if src and src["kind"] == "ask" else None) or (
+        DEFAULT_MODEL_EFFORT if model == DEFAULT_MODEL else "high")
     if not src:
         prompt = (PROMPTS / ("research.md" if research else "ask.md")).read_text(encoding="utf-8").strip() + f"\n\n## Question\n{question.strip()}\n"
     elif src["kind"] == "ask":
@@ -2062,7 +2067,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("ask", help="quick read-only consult: second opinion, lookup, or --research (web) report")
     p.add_argument("question", help="the question, or - to read it from stdin")
     p.add_argument("--model", help="sol (default, GPT-6.1 Sol), luna (cheaper), or a full model id; a follow-up keeps its thread's")
-    p.add_argument("--effort", choices=EFFORTS, help="default high; a follow-up keeps its ask's")
+    p.add_argument("--effort", choices=EFFORTS, help="default medium for GPT-6.1 Sol, high for other models; a follow-up keeps its ask's")
     p.add_argument("--continue", dest="cont", metavar="REF",
                    help="follow-up in an earlier thread: an ask id, `last`, or <run>/<task> (asks that worker, read-only)")
     p.add_argument("--web", action="store_true", help="enable live web search")

@@ -14,7 +14,7 @@ base = "HEAD"              # where worktrees branch from (default HEAD; commit y
 
 [defaults]                 # optional
 model = "gpt-6.1-sol"
-implementer_effort = "high"   # also explorer_effort, reviewer_effort
+implementer_effort = "medium" # also explorer_effort, reviewer_effort; Sol defaults to medium
 max_repairs = 1               # nonnegative integer: automatic repair rounds
 timeout_min = 30              # positive integer
 network = false               # let implementers use the network (e.g. package installs)
@@ -42,7 +42,7 @@ files = ["src/auth/**", "tests/auth/**"]   # owned paths; required when implemen
 checks = ["pytest tests/auth -q"]          # added to the plan-level checks
 effort = "high"
 verify = "codex"           # none | checks | codex | codex+adversary (default from risk: low→checks, medium→codex, high→codex+adversary)
-verify_effort = "high"     # verifier reasoning effort (the adversary always uses xhigh)
+verify_effort = "medium"   # Sol verifier default; the adversary always uses xhigh
 ```
 
 Rules `orc check` enforces:

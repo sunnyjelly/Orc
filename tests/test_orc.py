@@ -93,7 +93,7 @@ class OrcTest(unittest.TestCase):
     def test_check_renders_and_rejects_overlap(self):
         p = self.orc("check", "plan.toml")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn("| 2 | impl-a | implementer · sol high", p.stdout)
+        self.assertIn("| 2 | impl-a | implementer · sol medium", p.stdout)
         bad = PLAN.replace('files = ["impl-b.txt"]', 'files = ["impl-*.txt"]')
         (self.repo / "bad.toml").write_text(bad, encoding="utf-8")
         p = self.orc("check", "bad.toml")
@@ -121,9 +121,9 @@ class OrcTest(unittest.TestCase):
         out = p.stdout
         self.assertEqual(p.returncode, 0, out + p.stderr)
         self.assertIn("✓ scout [explorer·medium] done", out)
-        self.assertIn("✓ impl-a [implementer·high] verified", out)   # repaired after failing check
-        self.assertIn("✓ impl-b [implementer·high] verified", out)   # repaired after failing verifier
-        self.assertIn("✓ impl-c [implementer·high] checks-passed", out)
+        self.assertIn("✓ impl-a [implementer·medium] verified", out)   # repaired after failing check
+        self.assertIn("✓ impl-b [implementer·medium] verified", out)   # repaired after failing verifier
+        self.assertIn("✓ impl-c [implementer·medium] checks-passed", out)
         self.assertIn("orc merge", out)
         run_dir = next((self.repo / ".orc" / "runs").iterdir())
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
@@ -150,7 +150,7 @@ class OrcTest(unittest.TestCase):
 
         p = self.orc("report")
         rep = p.stdout
-        self.assertIn("| impl-a | implementer · high | verified (merged) | 3 |", rep)
+        self.assertIn("| impl-a | implementer · medium | verified (merged) | 3 |", rep)
         self.assertIn("**Codex (gpt-6.1-sol, ChatGPT plan):** 9 calls", rep)
         self.assertIn("5h 20% → 26%", rep)                      # Claude window delta
         self.assertIn("13k tokens (11k cache reads, 500 output)", rep)  # dedup of repeated message lines
@@ -161,20 +161,73 @@ class OrcTest(unittest.TestCase):
         self.orc("statusline", stdin=json.dumps({"session_id": "s2", "workspace": {"project_dir": str(self.repo)}}))
         p = self.orc("ask", "is this design sound?")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("fake answer (model=gpt-6.1-sol effort=high web=False)", p.stdout)  # Sol at high by default
-        self.assertIn("— sol · high ·", p.stdout)
+        self.assertIn("fake answer (model=gpt-6.1-sol effort=medium web=False)", p.stdout)  # Sol at medium by default
+        self.assertIn("— sol · medium ·", p.stdout)
         p = self.orc("ask", "--model", "luna", "--effort", "xhigh", "--web", "quick lookup?")
         self.assertIn("model=gpt-6-luna effort=xhigh web=True", p.stdout)
         p = self.orc("ask", "--research", "what changed in X?")
-        self.assertIn("- fake research finding (model=gpt-6.1-sol effort=high web=True)", p.stdout)
+        self.assertIn("- fake research finding (model=gpt-6.1-sol effort=medium web=True)", p.stdout)
         self.assertNotIn("long details", p.stdout)  # only the summary reaches the lead
         report_path = p.stdout.split("Full report: ")[1].splitlines()[0]
         self.assertIn("long details", Path(report_path).read_text(encoding="utf-8"))
         rep = self.orc("report").stdout
-        self.assertIn("| ask ×1 | sol · high | 1 ok | 1 |", rep)
+        self.assertIn("| ask ×1 | sol · medium | 1 ok | 1 |", rep)
         self.assertIn("| ask ×1 | luna · xhigh | 1 ok | 1 |", rep)
-        self.assertIn("| research ×1 | sol · high | 1 ok | 1 |", rep)
+        self.assertIn("| research ×1 | sol · medium | 1 ok | 1 |", rep)
         self.assertIn("gpt-6-luna, gpt-6.1-sol, ChatGPT plan):** 3 calls", rep)
+
+    def test_run_id_collision_keeps_its_timestamp_across_rollover(self):
+        import datetime as dt
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+        timestamp = "20261001-120000"
+        runs = self.repo / ".orc" / "runs"
+        (runs / timestamp).mkdir(parents=True)
+        path = self.repo / "scout.toml"
+        path.write_text('goal="scout"\n[[task]]\nid="scout"\nrole="explorer"\nwhy="w"\nbrief="b"\n', encoding="utf-8")
+        real_datetime = dt.datetime
+        class Rollover(real_datetime):
+            stamps = 0
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 1, 12, 0, 1, tzinfo=tz)
+            def strftime(self, fmt):
+                if fmt == "%Y%m%d-%H%M%S":
+                    type(self).stamps += 1
+                    return timestamp if type(self).stamps == 1 else "20261001-120001"
+                return super().strftime(fmt)
+        with patch.dict(os.environ, self.env):
+            mod = runpy.run_path(ORC[1], run_name="rollover_test")
+        output = io.StringIO()
+        with patch.dict(os.environ, self.env), patch.dict(mod["cmd_run"].__globals__, repo_root=lambda: self.repo), patch.object(dt, "datetime", Rollover), redirect_stdout(output):
+            result = mod["cmd_run"](SimpleNamespace(plan=str(path), only=None))
+        self.assertEqual(result, 0, output.getvalue())
+        self.assertTrue((runs / (timestamp + "-2") / "state.json").exists())
+        self.assertFalse((runs / "20261001-120001-2").exists())
+
+    def test_sol_defaults_and_explicit_effort_precedence(self):
+        mod = runpy.run_path(ORC[1], run_name="effort_test")
+        with patch("os.getcwd", return_value=str(self.repo)):
+            plan, errors, _ = mod["load_plan"](str(self.repo / "plan.toml"))
+        self.assertEqual(errors, [])
+        for task in plan["task"]:
+            self.assertEqual(task["effort"], "medium")
+            self.assertEqual(task["verify_effort"], "medium")
+        overrides = PLAN.replace('max_parallel = 2', 'max_parallel = 2\n[defaults]\nimplementer_effort = "high"')
+        overrides = overrides.replace('role = "explorer"', 'role = "explorer"\neffort = "xhigh"')
+        path = self.repo / "overrides.toml"
+        path.write_text(overrides, encoding="utf-8")
+        with patch("os.getcwd", return_value=str(self.repo)):
+            plan, errors, _ = mod["load_plan"](str(path))
+        self.assertEqual(errors, [])
+        self.assertEqual(plan["task"][0]["effort"], "xhigh")
+        self.assertEqual(plan["task"][1]["effort"], "high")
+        p = self.orc("ask", "--model", "luna", "q")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("model=gpt-6-luna effort=high", p.stdout)
+        p = self.orc("ask", "--effort", "high", "q")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("model=gpt-6.1-sol effort=high", p.stdout)
 
     @unittest.skipUnless(os.name == "nt", "Windows batch launcher boundary")
     def test_batch_launcher_preserves_shell_characters_in_worker_argv(self):
@@ -1087,7 +1140,7 @@ class OrcTest(unittest.TestCase):
         p = self.orc("show")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn(run_a, p.stdout)
-        self.assertIn("sol high  q\n", p.stdout)
+        self.assertIn("sol medium  q\n", p.stdout)
         self.assertEqual(self.orc("show", f"{run_a}/impl-a").returncode, 0)
         for ref in ("20200101-000000", "20200101-000000/x", "nope"):
             p = self.orc("show", ref)

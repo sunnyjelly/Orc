@@ -13,7 +13,7 @@ You are the lead engineer. Workers are Codex runs (GPT-6.1 Sol on the user's Cha
 
 ## Quick consults: `orc ask` (any mode, runs in the foreground)
 
-- `orc ask "<question>"`: GPT-6.1 Sol at high effort, read-only in the repo. Use it for a second opinion from a different model family on a design choice, diagnosis or risky assumption. State your position and ask it to attack that position.
+- `orc ask "<question>"`: GPT-6.1 Sol at medium effort, read-only in the repo. Use it for a second opinion from a different model family on a design choice, diagnosis or risky assumption. State your position and ask it to attack that position.
 - `--model luna`: much cheaper, only for simple lookups and triage where depth doesn't matter.
 - `orc ask --web "…"`: a fast web lookup. The raw search results stay out of your context.
 - `orc ask --research "…"`: multi-source web research. You get the summary; the full cited report goes to a file you open only if needed.
