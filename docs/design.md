@@ -65,9 +65,9 @@ The repo is a Claude Code plugin marketplace: `.claude-plugin/marketplace.json` 
 | Role | Sandbox | Effort | Where | Verification default |
 |---|---|---|---|---|
 | explorer | read-only | medium | repo root | none; the lead spot-checks key claims |
-| reviewer | read-only | high | repo root | none |
-| implementer | workspace-write | high | own worktree, branch `orc/<run>/<task>` | from `risk`: low → checks, medium → checks + verifier, high → checks + verifier + adversary |
-| verifier (internal) | read-only | high | implementer's worktree | fresh thread every round |
+| reviewer | read-only | medium for Sol; high otherwise | repo root | none |
+| implementer | workspace-write | medium for Sol; high otherwise | own worktree, branch `orc/<run>/<task>` | from `risk`: low → checks, medium → checks + verifier, high → checks + verifier + adversary |
+| verifier (internal) | read-only | medium for Sol; high otherwise | implementer's worktree | fresh thread every round |
 | adversary (internal) | read-only | xhigh | implementer's worktree | fresh thread |
 
 ## Consults (`orc ask`)
@@ -77,7 +77,7 @@ A consult is a single read-only Codex call that runs in the foreground, with no 
 - **Quick lookup**: `--web` turns on Codex live web search (`-c web_search="live"`).
 - **Deep research**: `--research`. A research preamble makes one agentic call search, cross-check and write a cited Markdown report to `.orc/asks/<id>.final.md`. The lead gets only the `## Summary` section and the file path.
 
-The default model is **GPT-6.1 Sol at high effort**, the preferred model everywhere. `--model luna` (GPT-6 Luna, about 20× cheaper per token) is opt-in for simple lookups; use it at high effort, since Luna at low effort is too weak to be useful. Luna is never used for implementation or verification.
+The default model is **GPT-6.1 Sol at medium effort**, the preferred model everywhere. `--model luna` (GPT-6 Luna, about 20× cheaper per token) is opt-in for simple lookups; use it at high effort, since Luna at low effort is too weak to be useful. Luna is never used for implementation or verification. Explicit task and plan effort settings override the model default; ask continuations retain their previous effort. The adversary still uses xhigh.
 
 Deep research is a flag on `ask`, not a plan feature. Research needs no worktrees, checks or merges, and one agentic call already runs many searches. For broad research that splits into independent areas, a plan with several `web = true` explorers does it in parallel.
 
