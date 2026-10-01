@@ -1656,6 +1656,16 @@ class OrcTest(unittest.TestCase):
         self.assertIn("0 run(s)", self.orc("report", "--since", "2099-01-01").stdout)
         self.assertEqual(self.orc("report", "--since", "not-a-date").returncode, 2)
 
+    def test_report_of_explicit_runs_omits_another_sessions_claude_usage(self):
+        self.orc("statusline", stdin=json.dumps({"session_id": "s1", "workspace": {"project_dir": str(self.repo)}}))
+        self.assertEqual(self.orc("run", self.review_plan()).returncode, 0)
+        run_id = next((self.repo / ".orc" / "runs").iterdir()).name
+        self.assertIn("**Claude (", self.orc("report", run_id).stdout)
+        self.orc("statusline", stdin=json.dumps({"session_id": "s2", "workspace": {"project_dir": str(self.repo)}}))
+        rep = self.orc("report", run_id).stdout
+        self.assertNotIn("**Claude (", rep)
+        self.assertIn("not started from this Claude session", rep)
+
     def test_feedback_post_merge_smoke_failure_is_recorded(self):
         self.assertEqual(self.orc("run", self.review_plan(extra='post_merge_checks=["false"]')).returncode, 0)
         rid, _ = self.state()

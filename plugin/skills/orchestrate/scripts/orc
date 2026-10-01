@@ -2107,6 +2107,9 @@ def cmd_report(a) -> int:
         run_dirs = [p for p in all_runs if isinstance(st := read_json(p / "state.json"), dict)
                     and (a.all or a.since or not sid or st.get("claude_session") == sid)]
     states = [st for p in run_dirs if isinstance(st := read_json(p / "state.json"), dict)]
+    other_session = bool(a.runs and claude and not any(s.get("claude_session") == sid for s in states))
+    if other_session:
+        claude = None  # these runs came from another Claude session; don't add this session's usage to them
     asks = [x for x in read_jsonl(d.parent / "asks" / "asks.jsonl")
             if (a.all or a.since or not sid or x.get("claude_session") == sid) and not a.runs]
     if a.since:
@@ -2189,6 +2192,8 @@ def cmd_report(a) -> int:
                    f"{fmt_tok(total_in + u['output_tokens'])} tokens ({fmt_tok(u['cache_read_input_tokens'])} cache reads, "
                    f"{fmt_tok(u['output_tokens'])} output) · ≈ ${c_cost:.2f} API-equivalent · "
                    f"{fmt_windows(claude_windows(claude), claude_windows(claude.get('first')))}")
+    elif other_session:
+        out.append("**Claude:** not shown; the selected runs were not started from this Claude session.")
     else:
         out.append("**Claude:** no statusline snapshot found for this project; run `orc setup` once (it sets the status line).")
     out.append(f"**Total ≈ ${cost + (c_cost or 0):.2f} API-equivalent** (what these tokens would cost at API list prices; "
