@@ -148,6 +148,17 @@ class OrcTest(unittest.TestCase):
         self.assertIn("Gates: 3 implementers · 3 verifier rounds, 1 failed → 2 repairs · 3/3 passed", report)
         self.assertIn("concurrent use can leak in", report)
 
+    def test_orc_quota_merges_overlapping_calls_and_caps_at_account(self):
+        mod = runpy.run_path(str(ORC[1]))
+        def snap(pct, reset=1000):
+            return {"rate_limits": {"primary": {"used_percent": pct, "window_minutes": 300, "resets_at": reset}}}
+        def call(start, end, t0, t1):
+            return {"codex_start": snap(start), "codex_end": snap(end), "started": f"2026-10-27T14:{t0}:00", "finished": f"2026-10-27T14:{t1}:00"}
+        parallel = [call(10, 13, "00", "05"), call(10, 13, "01", "04"), call(14, 15, "10", "12")]
+        self.assertEqual(mod["orc_quota"](parallel), {"5h": 4})  # the two overlapping calls count once
+        self.assertEqual(mod["orc_quota"](parallel, {"5h": ((10, 1000), (12, 1000))}), {"5h": 2})  # never above the account rise
+        self.assertEqual(mod["orc_quota"]([call(10, 2, "00", "01")]), {})  # window reset mid-call
+
     def test_codex_limits_marks_other_thread_fallback(self):
         mod = runpy.run_path(str(ORC[1]))
         sessions = self.tmp / "codex" / "sessions" / "2026" / "01" / "01"

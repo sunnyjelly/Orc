@@ -586,6 +586,30 @@ def window_reset(before: tuple, after: tuple) -> bool:
                                     and abs(float(after[1]) - float(before[1])) > 60)
 
 
+def orc_quota(calls: list[dict], account: dict | None = None) -> dict:
+    """Quota percentage points orc's own calls used per window. Overlapping calls see the same meter rise, so
+    they are merged into one span (lowest start → highest end); the sum is capped at the account-wide rise."""
+    totals, spans = {}, []
+    for c in sorted((c for c in calls if c.get("codex_start") and c.get("codex_end")), key=lambda c: c.get("started") or ""):
+        if spans and c.get("started") and spans[-1]["until"] and c["started"] < spans[-1]["until"]:
+            spans[-1]["calls"].append(c)
+            spans[-1]["until"] = max(spans[-1]["until"], c.get("finished") or "")
+        else:
+            spans.append({"calls": [c], "until": c.get("finished") or ""})
+    for span in spans:
+        starts = [codex_windows(c["codex_start"]) for c in span["calls"]]
+        ends = [codex_windows(c["codex_end"]) for c in span["calls"]]
+        for label in set().union(*starts) & set().union(*ends):
+            lo = min((w[label] for w in starts if label in w), key=lambda x: x[0])
+            hi = max((w[label] for w in ends if label in w), key=lambda x: x[0])
+            if not window_reset(lo, hi):
+                totals[label] = totals.get(label, 0) + max(0, hi[0] - lo[0])
+    for label, (before, after) in (account or {}).items():
+        if label in totals and not window_reset(before, after):
+            totals[label] = min(totals[label], max(0, after[0] - before[0]))
+    return totals
+
+
 def fmt_windows(now: dict, start: dict | None = None) -> str:
     if not now:
         return "limits n/a"
@@ -2244,18 +2268,14 @@ def cmd_report(a) -> int:
         if smoke:
             out += ["", *smoke]
         all_calls = [c for s in states for r in state_tasks(s).values() for c in r.get("calls", [])] + asks
-        totals, approx = {}, False
-        for c in all_calls:
-            approx = approx or (c.get("codex_end") or {}).get("source") == "other"
-            start, end = codex_windows(c.get("codex_start")), codex_windows(c.get("codex_end"))
-            for label in start.keys() & end.keys():
-                if not window_reset(start[label], end[label]):
-                    totals[label] = totals.get(label, 0) + max(0, end[label][0] - start[label][0])
+        now_w, first_w = codex_windows(read_json(ORC_HOME / 'codex-limits.json')), codex_windows(first_codex)
+        totals = orc_quota(all_calls, {k: (first_w[k], now_w[k]) for k in first_w.keys() & now_w.keys()})
+        approx = any((c.get("codex_end") or {}).get("source") == "other" for c in all_calls)
         estimate = (", ".join(f"+{totals[label]:.0f}% {label}" for label in sorted(totals)) or "n/a") + (
             " (some snapshots from other threads)" if approx and totals else "")
         out += ["", f"**Codex ({', '.join(sorted(models))}, ChatGPT plan):** {calls} calls · {fmt_tok(usage['input_tokens'] + usage['output_tokens'])} tokens "
                     f"({fmt_tok(usage['cached_input_tokens'])} cached input, {fmt_tok(usage['output_tokens'])} output) · ≈ ${cost:.2f} API-equivalent · "
-                    f"{fmt_windows(codex_windows(read_json(ORC_HOME / 'codex-limits.json')), codex_windows(first_codex))} · orc calls ≈ {estimate}"]
+                    f"{fmt_windows(now_w, first_w)} · orc calls ≈ {estimate}"]
         out.append("Time sums call durations; parallel calls overlap. Account-wide quota includes other Codex use; orc calls covers only orc calls, at account meter granularity, so concurrent use can leak in.")
         if a.calls:
             out += ["", "| call | model · effort | result | time | output tok/min | quota before → after |",

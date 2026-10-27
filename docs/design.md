@@ -136,7 +136,7 @@ Quota is checked after acquiring a Codex process slot, and the completed call's 
 - **Claude cost**: `cost.total_cost_usd` from the status line, which Claude Code computes at list price. It falls back to `pricing.toml`.
 - **Claude limit %**: `rate_limits.five_hour` / `seven_day` from the status line. The first value seen in the session is kept, so the report shows start → now.
 - **Scope**: `orc report` covers every run started from the current Claude session (matched by session id), plus the whole Claude session. Without a matching session snapshot, all project history is included and clearly labeled. Explicit run IDs, `--all`, `--since` and `--calls` control scope and detail.
-- **Report details**: `orc calls ≈ +N%` estimates per-call quota increases; concurrent account use, meter granularity and snapshots from other threads limit attribution. The Gates line counts implementers, verifier rounds, failed verdict rounds, repairs and passed implementers; errored verdicts are uncertain. See [execution.md](../plugin/skills/orchestrate/reference/execution.md) for accounting details.
+- **Report details**: `orc calls ≈ +N%` sums per-call quota increases (`orc_quota()`: overlapping calls merged into one span, capped at the account-wide rise); concurrent account use, meter granularity and snapshots from other threads limit attribution. The Gates line counts implementers, verifier rounds, failed verdict rounds, repairs and passed implementers; errored verdicts are uncertain. See [execution.md](../plugin/skills/orchestrate/reference/execution.md) for accounting details.
 
 ## Live validation and remaining assumptions
 
