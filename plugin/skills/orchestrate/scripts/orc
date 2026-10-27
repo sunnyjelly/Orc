@@ -39,10 +39,11 @@ CODEX = os.environ.get("ORC_CODEX_BIN", "codex")
 CODEX = shutil.which(CODEX) or CODEX  # Windows: npm installs codex.cmd, which CreateProcess won't find by bare name
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 
-DEFAULT_MODEL = "gpt-6.1-sol"
-DEFAULT_MODEL_EFFORT = "medium"
+DEFAULT_MODEL = "gpt-6.1-terra"  # basic work; the lead picks Sol for harder tasks
+FALLBACK_MODEL = "gpt-6.1-sol"   # a failed fresh Terra call is retried once on Sol
 # Short names the lead can use. Update when OpenAI ships newer versions (e.g. a 6.1 Luna).
-MODEL_ALIASES = {"sol": "gpt-6.1-sol", "luna": "gpt-6-luna"}
+MODEL_ALIASES = {"terra": "gpt-6.1-terra", "sol": "gpt-6.1-sol", "luna": "gpt-6-luna"}
+MODEL_EFFORTS = {"gpt-6.1-terra": "high", "gpt-6.1-sol": "medium"}  # default effort per model; others use the role's
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ROLES = {
     "explorer":    {"sandbox": "read-only",       "writes": False, "effort": "medium"},
@@ -664,6 +665,10 @@ def resolve_model(name: str) -> str:
     return MODEL_ALIASES.get(name, name)
 
 
+def default_effort(model: str, fallback: str = "high") -> str:
+    return MODEL_EFFORTS.get(model, fallback)
+
+
 def load_plan(path: str) -> tuple[dict, list[str], list[str]]:
     """Parse and validate a plan. Returns (plan, errors, warnings)."""
     try:
@@ -748,14 +753,13 @@ def load_plan(path: str) -> tuple[dict, list[str], list[str]]:
         t["web"] = bool(t.get("web", False))
         if t["web"] and t["writes"]:
             errs.append(f"{tid}: `web` is for explorer/reviewer tasks; research first, then implement")
-        t["effort"] = t.get("effort") or defaults.get(f"{role}_effort") or (
-            DEFAULT_MODEL_EFFORT if t["model"] == DEFAULT_MODEL else ROLES[role]["effort"])
+        t["effort"] = t.get("effort") or defaults.get(f"{role}_effort") or default_effort(t["model"], ROLES[role]["effort"])
         if t["effort"] not in EFFORTS:
             errs.append(f"{tid}: effort must be one of {', '.join(EFFORTS)}")
         t["verify"] = t.get("verify") or (VERIFY_BY_RISK[risk] if t["writes"] else "none")
         if t["verify"] not in VERIFY_LEVELS:
             errs.append(f"{tid}: verify must be one of {', '.join(VERIFY_LEVELS)}")
-        t["verify_effort"] = t.get("verify_effort", DEFAULT_MODEL_EFFORT if t["model"] == DEFAULT_MODEL else "high")
+        t["verify_effort"] = t.get("verify_effort", default_effort(t["model"]))
         if t["verify_effort"] not in EFFORTS:
             errs.append(f"{tid}: verify_effort must be one of {', '.join(EFFORTS)}")
         t["acceptance"] = list(t.get("acceptance", []))
@@ -939,10 +943,26 @@ def call_succeeded(call: dict) -> bool:
     return call.get("final") is not None and not call.get("error")
 
 
+def wants_fallback(call: dict, resume: str | None) -> bool:
+    """A fresh Terra call that failed on its own (capacity, API error, no result): worth one retry on Sol.
+    Not for resumed threads (Sol can't resume a Terra thread), quota skips, or limits orc itself enforced."""
+    err = call.get("error") or ""
+    return (call.get("model") == DEFAULT_MODEL != FALLBACK_MODEL and not resume and not call_succeeded(call)
+            and not call.get("skipped") and not any(k in err for k in ("timeout", "tool budget", "codex not found", "codex launch failed")))
+
+
+def retire_attempt(logdir: Path, call: dict) -> None:
+    """Move a failed attempt's logs aside so the retry can use its name; keep it for accounting."""
+    old, new = call["name"], f"{call['name']}~{short_model(call.get('model'))}"
+    for f in list(logdir.glob(f"{old}.*")):
+        f.replace(logdir / (new + f.name[len(old):]))
+    call.update(name=new, superseded=True)
+
+
 def task_thread(rec: dict) -> str | None:
     """The worker's own Codex thread (not a verifier's): the one repairs, steers and follow-ups resume."""
     calls = rec.get("calls") if isinstance(rec, dict) and isinstance(rec.get("calls"), list) else []
-    return next((c["thread"] for c in reversed(calls) if isinstance(c, dict) and c.get("thread")
+    return next((c["thread"] for c in reversed(calls) if isinstance(c, dict) and c.get("thread") and not c.get("superseded")
                  and str(c.get("name", "")).startswith(("worker", "repair", "steer"))), None)
 
 
@@ -1107,6 +1127,8 @@ class Run:
             t["files"] = list(dict.fromkeys(t["files"] + rec.get("extra_files", [])))
             if "acceptance_override" in rec:
                 t["acceptance"] = rec["acceptance_override"]
+            if rec.get("fallback"):  # the worker thread is Sol's now; resumes, repairs and steers must use Sol
+                t["model"], t["effort"] = rec["model"], rec["effort"]
 
     def save(self):
         with self.lock:
@@ -1121,12 +1143,31 @@ class Run:
         print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
     def codex(self, task: dict, name: str, prompt: str, schema: str, cwd: Path, sandbox: str,
-              resume: str | None = None, effort: str | None = None) -> dict:
-        with thread_turn(self.repo, resume, f"{self.id}/{task['id']}", writes=sandbox == "workspace-write"):
-            return codex_exec(model=task["model"], effort=effort or task["effort"], sandbox=sandbox, cwd=cwd, prompt=prompt,
-                              logdir=self.dir / task["id"], name=name, schema=schema, resume=resume,
-                              network=task["network"], web=task["web"], timeout_min=task["timeout_min"],
-                              slots=self.slots, quota_stop=self.quota_stop, pricing=self.pricing)
+              resume: str | None = None, effort: str | None = None, rec: dict | None = None) -> dict:
+        """One Codex call for `task`. A failed fresh Terra call is retried once on Sol at Sol's effort; the
+        failed attempt goes into `rec['calls']`, and a worker that fell back keeps Sol for the rest of the task."""
+        logdir = self.dir / task["id"]
+        def call(model, eff):
+            with thread_turn(self.repo, resume, f"{self.id}/{task['id']}", writes=sandbox == "workspace-write"):
+                return codex_exec(model=model, effort=eff, sandbox=sandbox, cwd=cwd, prompt=prompt,
+                                  logdir=logdir, name=name, schema=schema, resume=resume,
+                                  network=task["network"], web=task["web"], timeout_min=task["timeout_min"],
+                                  slots=self.slots, quota_stop=self.quota_stop, pricing=self.pricing)
+        first = call(task["model"], effort or task["effort"])
+        if rec is None or not wants_fallback(first, resume):
+            return first
+        self.log(f"↻ {task['id']}/{name}: {short_model(first['model'])} failed ({clip(first['error'], 80)}); retrying on {short_model(FALLBACK_MODEL)}")
+        retire_attempt(logdir, first)
+        with self.lock:
+            rec["calls"].append(first)
+        if sandbox == "workspace-write":  # drop any partial edits; the retry starts from the same commit
+            git("reset", "-q", "--hard", "HEAD", cwd=cwd, check=False)
+            git("clean", "-fdq", cwd=cwd, check=False)
+        retry = call(FALLBACK_MODEL, default_effort(FALLBACK_MODEL))
+        if name.startswith("worker") and call_succeeded(retry):
+            task["model"], task["effort"] = retry["model"], retry["effort"]
+            rec.update(model=retry["model"], effort=retry["effort"], fallback={"from": first["model"], "error": first["error"]})
+        return retry
 
     # ------------------------------------------------------------ prompts
 
@@ -1231,7 +1272,7 @@ class Run:
         n = len(rec["calls"])
         with cf.ThreadPoolExecutor(len(kinds) or 1) as ex:
             futs = [ex.submit(self.codex, t, f"{k}{n}", self.review_prompt(t, k, base, rec), "verdict", wt, "read-only",
-                              effort="xhigh" if k == "adversary" else t.get("verify_effort", "high")) for k in kinds]
+                              effort="xhigh" if k == "adversary" else t.get("verify_effort", "high"), rec=rec) for k in kinds]
             calls = [f.result() for f in futs]
         rec["calls"] += calls
         return calls
@@ -1271,7 +1312,7 @@ class Run:
                 self.save()
                 name = f"worker{len(rec['calls'])}" if rec["calls"] else "worker"
                 resume = task_thread(rec) or (self.continued(t) or {}).get("thread")
-                call = self.codex(t, name, self.worker_prompt(t, cwd), "worker-result", cwd, "read-only", resume=resume)
+                call = self.codex(t, name, self.worker_prompt(t, cwd), "worker-result", cwd, "read-only", resume=resume, rec=rec)
                 rec["calls"].append(call)
                 rec["result"] = call["final"]
                 rec["status"] = call["final"]["status"] if call_succeeded(call) else ("skipped" if call.get("skipped") else "error")
@@ -1308,7 +1349,7 @@ class Run:
         if self.continued(t) and thread and thread_history(self.repo, thread)[0]:  # re-check: `resume` may run long after `check`
             raise RuntimeError(f"the thread of {t['continues']} has used web search, so it can't resume with write access; re-plan")
         name = f"worker{len(rec['calls'])}" if rec["calls"] else "worker"
-        call = self.codex(t, name, self.worker_prompt(t, wt), "worker-result", wt, "workspace-write", resume=thread)
+        call = self.codex(t, name, self.worker_prompt(t, wt), "worker-result", wt, "workspace-write", resume=thread, rec=rec)
         rec["calls"].append(call)
         rec["result"], thread = call["final"], call["thread"]
         self.save()  # publish the worker thread before checks and repairs
@@ -1512,6 +1553,8 @@ def task_line(r: dict, max_findings: int = 10, run_id: str = "<run>") -> list[st
     repairs = sum(c["name"].startswith("repair") for c in r.get("calls", []))
     if repairs:
         bits.append(f"repaired {repairs}x")
+    if r.get("fallback"):
+        bits.append(f"{short_model(r['fallback'].get('from'))} failed, ran on {short_model(r.get('model'))}")
     if r.get("diffstat"):
         bits.append(shortstat(r["diffstat"]))
     bits.append(f"{len(r.get('calls', []))} calls · {fmt_tok(usage['input_tokens'] + usage['output_tokens'])} tok · ≈${cost:.2f} · {fmt_secs(secs)}")
@@ -2143,7 +2186,7 @@ def cmd_report(a) -> int:
         u = {k: 0 for k in USAGE_KEYS}
         for c in cs:
             u = add_usage(u, c.get("usage") or {})
-            models.add(c.get("model") or DEFAULT_MODEL)
+            models.add(c.get("model") or "gpt-6.1-sol")  # records without a model predate Terra
         c_cost = sum(c.get("cost") or 0 for c in cs)
         usage, cost, calls = add_usage(usage, u), cost + c_cost, calls + len(cs)
         out.append(f"| {name} | {kind} | {result} | {len(cs)} | {fmt_tok(u['input_tokens'])} ({fmt_tok(u['cached_input_tokens'])}) / "
@@ -2254,9 +2297,8 @@ def cmd_ask(a) -> int:
     timeout = a.timeout or (minutes if research else 10)
     max_tools = a.max_tools or (tools if research else None)
     web = (a.web or research or bool((src or {}).get("web"))) and not (src and src["kind"] == "task")
-    model = resolve_model(a.model or (src or {}).get("model") or "sol")
-    effort = a.effort or (src["effort"] if src and src["kind"] == "ask" else None) or (
-        DEFAULT_MODEL_EFFORT if model == DEFAULT_MODEL else "high")
+    model = resolve_model(a.model or (src or {}).get("model") or DEFAULT_MODEL)
+    effort = a.effort or (src["effort"] if src and src["kind"] == "ask" else None) or default_effort(model)
     if not src:
         prompt = (PROMPTS / ("research.md" if research else "ask.md")).read_text(encoding="utf-8").strip() + f"\n\n## Question\n{question.strip()}\n"
     elif src["kind"] == "ask":
@@ -2286,19 +2328,31 @@ def cmd_ask(a) -> int:
               file=sys.stderr, flush=True)
     try:
         with thread_turn(repo, (src or {}).get("thread"), (src or {}).get("root") if src and src["kind"] == "task" else None):
-            rec = codex_exec(model=model, effort=effort, sandbox="read-only", cwd=cwd, prompt=prompt, logdir=d, name=ask_id,
-                              web=web, resume=(src or {}).get("thread"), timeout_min=timeout, max_tools=max_tools)
-            entry = {"id": ask_id, "at": now_iso(), "question": clip(question, 300), "research": research, "web": web, "depth": depth,
-                     "claude_session": sid, "codex_start": codex_start,
-                     **({"parent": src["ref"], "root": src["root"]} if src else {}),
-                      **{k: rec.get(k) for k in ("model", "effort", "usage", "cost", "seconds", "thread", "error", "codex_end", "started", "finished")}}
-            with open(d / "asks.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry) + "\n")
+            def attempt(m, e):
+                return codex_exec(model=m, effort=e, sandbox="read-only", cwd=cwd, prompt=prompt, logdir=d, name=ask_id,
+                                  web=web, resume=(src or {}).get("thread"), timeout_min=timeout, max_tools=max_tools)
+            def log_ask(r, **extra):
+                entry = {"id": r["name"], "at": now_iso(), "question": clip(question, 300), "research": research, "web": web,
+                         "depth": depth, "claude_session": sid, "codex_start": codex_start,
+                         **({"parent": src["ref"], "root": src["root"]} if src else {}), **extra,
+                         **{k: r.get(k) for k in ("model", "effort", "usage", "cost", "seconds", "thread", "error", "codex_end", "started", "finished")}}
+                with open(d / "asks.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+            rec, retried_from = attempt(model, effort), None
+            if wants_fallback(rec, (src or {}).get("thread")):
+                print(f"{short_model(model)} failed ({clip(rec['error'], 80)}); retrying on {short_model(FALLBACK_MODEL)}",
+                      file=sys.stderr, flush=True)
+                retire_attempt(d, rec)
+                log_ask(rec, superseded_by=ask_id)
+                retried_from, model, effort = model, FALLBACK_MODEL, default_effort(FALLBACK_MODEL)
+                rec = attempt(model, effort)
+            log_ask(rec)
     except RuntimeError as e:
         die(str(e))
     footer = (f"— {short_model(model)} · {effort}{' · web' if web else ''} · "
               f"{fmt_tok(rec['usage']['input_tokens'] + rec['usage']['output_tokens'])} tok · ≈${rec.get('cost') or 0:.2f} · "
-              f"{fmt_secs(rec.get('seconds'))} · ask {ask_id}" + (f" (follow-up to {src['ref']})" if src else ""))
+              f"{fmt_secs(rec.get('seconds'))} · ask {ask_id}" + (f" (follow-up to {src['ref']})" if src else "")
+              + (f" · {short_model(retried_from)} failed, retried on {short_model(model)}" if retried_from else ""))
     if not call_succeeded(rec):
         print(f"ask failed: {rec['error']}\n{footer}")
         return 1
@@ -2570,8 +2624,9 @@ def main(argv=None) -> int:
     p.add_argument("--calls", action="store_true", help="show individual calls, model, rate and quota snapshots")
     p = sub.add_parser("ask", help="quick read-only consult: second opinion, lookup, or --research (web) report")
     p.add_argument("question", help="the question, or - to read it from stdin")
-    p.add_argument("--model", help="sol (default, GPT-6.1 Sol), luna (cheaper), or a full model id; a follow-up keeps its thread's")
-    p.add_argument("--effort", choices=EFFORTS, help="default medium for GPT-6.1 Sol, high for other models; a follow-up keeps its ask's")
+    p.add_argument("--model", help="terra (default, GPT-6.1 Terra), sol (harder questions), luna (cheaper), or a full model id; "
+                                  "a follow-up keeps its thread's")
+    p.add_argument("--effort", choices=EFFORTS, help="default high for Terra, medium for Sol, high for other models; a follow-up keeps its ask's")
     p.add_argument("--continue", dest="cont", metavar="REF",
                    help="follow-up in an earlier thread: an ask id, `last`, or <run>/<task> (asks that worker, read-only)")
     p.add_argument("--web", action="store_true", help="enable live web search")

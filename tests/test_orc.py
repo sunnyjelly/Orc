@@ -94,7 +94,7 @@ class OrcTest(unittest.TestCase):
     def test_check_renders_and_rejects_overlap(self):
         p = self.orc("check", "plan.toml")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn("| 2 | impl-a | implementer · sol medium", p.stdout)
+        self.assertIn("| 2 | impl-a | implementer · terra high", p.stdout)
         bad = PLAN.replace('files = ["impl-b.txt"]', 'files = ["impl-*.txt"]')
         (self.repo / "bad.toml").write_text(bad, encoding="utf-8")
         p = self.orc("check", "bad.toml")
@@ -121,10 +121,10 @@ class OrcTest(unittest.TestCase):
         p = self.orc("run", "plan.toml")
         out = p.stdout
         self.assertEqual(p.returncode, 0, out + p.stderr)
-        self.assertIn("✓ scout [explorer·sol·medium] done", out)
-        self.assertIn("✓ impl-a [implementer·sol·medium] verified", out)   # repaired after failing check
-        self.assertIn("✓ impl-b [implementer·sol·medium] verified", out)   # repaired after failing verifier
-        self.assertIn("✓ impl-c [implementer·sol·medium] checks-passed", out)
+        self.assertIn("✓ scout [explorer·terra·high] done", out)
+        self.assertIn("✓ impl-a [implementer·terra·high] verified", out)   # repaired after failing check
+        self.assertIn("✓ impl-b [implementer·terra·high] verified", out)   # repaired after failing verifier
+        self.assertIn("✓ impl-c [implementer·terra·high] checks-passed", out)
         self.assertIn("orc merge", out)
         run_dir = next((self.repo / ".orc" / "runs").iterdir())
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
@@ -151,8 +151,8 @@ class OrcTest(unittest.TestCase):
 
         p = self.orc("report")
         rep = p.stdout
-        self.assertIn("| impl-a | implementer · sol · medium | verified (merged) | 3 |", rep)
-        self.assertIn("**Codex (gpt-6.1-sol, ChatGPT plan):** 9 calls", rep)
+        self.assertIn("| impl-a | implementer · terra · high | verified (merged) | 3 |", rep)
+        self.assertIn("**Codex (gpt-6.1-terra, ChatGPT plan):** 9 calls", rep)
         self.assertIn("5h 20% → 26%", rep)                      # Claude window delta
         self.assertIn("13k tokens (11k cache reads, 500 output)", rep)  # dedup of repeated message lines
         self.assertIn("≈ $0.42 API-equivalent", rep)
@@ -162,20 +162,20 @@ class OrcTest(unittest.TestCase):
         self.orc("statusline", stdin=json.dumps({"session_id": "s2", "workspace": {"project_dir": str(self.repo)}}))
         p = self.orc("ask", "is this design sound?")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("fake answer (model=gpt-6.1-sol effort=medium web=False)", p.stdout)  # Sol at medium by default
-        self.assertIn("— sol · medium ·", p.stdout)
+        self.assertIn("fake answer (model=gpt-6.1-terra effort=high web=False)", p.stdout)  # Terra at high by default
+        self.assertIn("— terra · high ·", p.stdout)
         p = self.orc("ask", "--model", "luna", "--effort", "xhigh", "--web", "quick lookup?")
         self.assertIn("model=gpt-6-luna effort=xhigh web=True", p.stdout)
         p = self.orc("ask", "--research", "what changed in X?")
-        self.assertIn("- fake research finding (model=gpt-6.1-sol effort=medium web=True)", p.stdout)
+        self.assertIn("- fake research finding (model=gpt-6.1-terra effort=high web=True)", p.stdout)
         self.assertNotIn("long details", p.stdout)  # only the summary reaches the lead
         report_path = p.stdout.split("Full report: ")[1].splitlines()[0]
         self.assertIn("long details", Path(report_path).read_text(encoding="utf-8"))
         rep = self.orc("report").stdout
-        self.assertIn("| ask ×1 | sol · medium | 1 ok | 1 |", rep)
+        self.assertIn("| ask ×1 | terra · high | 1 ok | 1 |", rep)
         self.assertIn("| ask ×1 | luna · xhigh | 1 ok | 1 |", rep)
-        self.assertIn("| research ×1 | sol · medium | 1 ok | 1 |", rep)
-        self.assertIn("gpt-6-luna, gpt-6.1-sol, ChatGPT plan):** 3 calls", rep)
+        self.assertIn("| research ×1 | terra · high | 1 ok | 1 |", rep)
+        self.assertIn("gpt-6-luna, gpt-6.1-terra, ChatGPT plan):** 3 calls", rep)
 
     def test_run_id_collision_keeps_its_timestamp_across_rollover(self):
         import datetime as dt
@@ -206,14 +206,21 @@ class OrcTest(unittest.TestCase):
         self.assertTrue((runs / (timestamp + "-2") / "state.json").exists())
         self.assertFalse((runs / "20261001-120001-2").exists())
 
-    def test_sol_defaults_and_explicit_effort_precedence(self):
+    def test_model_defaults_and_explicit_effort_precedence(self):
         mod = runpy.run_path(ORC[1], run_name="effort_test")
         with patch("os.getcwd", return_value=str(self.repo)):
             plan, errors, _ = mod["load_plan"](str(self.repo / "plan.toml"))
         self.assertEqual(errors, [])
-        for task in plan["task"]:
-            self.assertEqual(task["effort"], "medium")
-            self.assertEqual(task["verify_effort"], "medium")
+        for task in plan["task"]:  # Terra at high by default, for every role
+            self.assertEqual((task["model"], task["effort"], task["verify_effort"]), ("gpt-6.1-terra", "high", "high"))
+        sol = PLAN.replace('role = "explorer"', 'role = "explorer"\nmodel = "sol"')
+        path = self.repo / "sol.toml"
+        path.write_text(sol, encoding="utf-8")
+        with patch("os.getcwd", return_value=str(self.repo)):
+            plan, errors, _ = mod["load_plan"](str(path))
+        self.assertEqual(errors, [])
+        self.assertEqual((plan["task"][0]["model"], plan["task"][0]["effort"], plan["task"][0]["verify_effort"]),
+                         ("gpt-6.1-sol", "medium", "medium"))  # Sol, for harder tasks, at medium
         overrides = PLAN.replace('max_parallel = 2', 'max_parallel = 2\n[defaults]\nimplementer_effort = "high"')
         overrides = overrides.replace('role = "explorer"', 'role = "explorer"\neffort = "xhigh"')
         path = self.repo / "overrides.toml"
@@ -226,9 +233,60 @@ class OrcTest(unittest.TestCase):
         p = self.orc("ask", "--model", "luna", "q")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("model=gpt-6-luna effort=high", p.stdout)
-        p = self.orc("ask", "--effort", "high", "q")
+        p = self.orc("ask", "--model", "sol", "q")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn("model=gpt-6.1-sol effort=high", p.stdout)
+        self.assertIn("model=gpt-6.1-sol effort=medium", p.stdout)
+        p = self.orc("ask", "--effort", "medium", "q")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("model=gpt-6.1-terra effort=medium", p.stdout)
+
+    def test_failed_terra_ask_falls_back_to_sol(self):
+        p = self.orc("ask", "FAKE_TERRA_CAPACITY q")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("model=gpt-6.1-sol effort=medium", p.stdout)
+        self.assertIn("terra failed, retried on sol", p.stdout)
+        self.assertIn("at capacity", p.stderr)
+        asks = [json.loads(line) for line in (self.repo / ".orc" / "asks" / "asks.jsonl").read_text(encoding="utf-8").splitlines()]
+        ask_id = p.stdout.rsplit("· ask ", 1)[1].split()[0]
+        self.assertEqual([(x["id"], x["model"], bool(x["error"])) for x in asks],
+                         [(ask_id + "~terra", "gpt-6.1-terra", True), (ask_id, "gpt-6.1-sol", False)])
+        self.assertTrue((self.repo / ".orc" / "asks" / f"{ask_id}~terra.events.jsonl").exists())
+        rep = self.orc("report").stdout
+        self.assertIn("| ask ×1 | terra · high | 0 ok, 1 failed | 1 |", rep)
+        self.assertIn("| ask ×1 | sol · medium | 1 ok | 1 |", rep)
+        p = self.orc("ask", "--continue", "last", "FAKE_TERRA_CAPACITY again")  # continues Sol's thread, on Sol
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("model=gpt-6.1-sol", p.stdout)
+        self.assertNotIn("retried", p.stdout)
+        mod = runpy.run_path(ORC[1], run_name="fallback_test")
+        failed = {"model": "gpt-6.1-terra", "final": None, "error": "Selected model is at capacity"}
+        self.assertTrue(mod["wants_fallback"](failed, None))
+        self.assertFalse(mod["wants_fallback"](failed, "thread-1"))  # Sol can't resume a Terra thread
+        self.assertFalse(mod["wants_fallback"]({**failed, "model": "gpt-6.1-sol"}, None))
+        self.assertFalse(mod["wants_fallback"]({**failed, "skipped": True}, None))  # quota stop
+        for err in ("exit timeout; no valid final message", "tool budget exceeded (12); process tree stopped",
+                    "exit codex not found (set ORC_CODEX_BIN or install @openai/codex); no valid final message"):
+            self.assertFalse(mod["wants_fallback"]({**failed, "error": err}, None), err)
+
+    def test_failed_terra_worker_falls_back_to_sol_for_the_rest_of_the_task(self):
+        plan = PLAN.replace('brief = "Write the other file. FAKE_FAIL_VERIFY_ONCE"',
+                            'brief = "Write the other file. FAKE_FAIL_VERIFY_ONCE FAKE_TERRA_CAPACITY"')
+        (self.repo / "fallback.toml").write_text(plan, encoding="utf-8")
+        p = self.orc("run", "fallback.toml")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("✓ impl-b [implementer·sol·medium] verified", p.stdout)
+        self.assertIn("✓ impl-a [implementer·terra·high] verified", p.stdout)
+        self.assertIn("terra failed, ran on sol", p.stdout)
+        self.assertIn("retrying on sol", p.stderr)
+        _, st = self.state()
+        b = st["tasks"]["impl-b"]
+        self.assertEqual([(c["name"], c["model"]) for c in b["calls"]],
+                         [("worker~terra", "gpt-6.1-terra"), ("worker", "gpt-6.1-sol"), ("verifier2", "gpt-6.1-sol"),
+                          ("repair1", "gpt-6.1-sol"), ("verifier4", "gpt-6.1-sol")])
+        self.assertEqual(b["calls"][1]["effort"], "medium")
+        self.assertEqual(b["calls"][1]["thread"], b["calls"][3]["thread"])  # the repair resumed Sol's thread
+        self.assertEqual(b["fallback"]["from"], "gpt-6.1-terra")
+        self.assertIn("at capacity", b["fallback"]["error"])
 
     @unittest.skipUnless(os.name == "nt", "Windows batch launcher boundary")
     def test_batch_launcher_preserves_shell_characters_in_worker_argv(self):
@@ -648,7 +706,9 @@ class OrcTest(unittest.TestCase):
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         _, st = self.state()
         self.assertEqual(st["tasks"]["base"]["status"], "error")
-        self.assertEqual(len(st["tasks"]["base"]["calls"]), 1)
+        calls = st["tasks"]["base"]["calls"]  # the failed Terra worker was retried once on Sol, which failed too
+        self.assertEqual([(c["name"], c["model"]) for c in calls], [("worker~terra", "gpt-6.1-terra"), ("worker", "gpt-6.1-sol")])
+        self.assertEqual(st["tasks"]["base"]["model"], "gpt-6.1-terra")  # no successful fallback, so the task keeps Terra
 
     def test_readonly_error_with_final_json_does_not_pass(self):
         plan = self.plan("reader.toml", '''
@@ -1141,7 +1201,7 @@ class OrcTest(unittest.TestCase):
         p = self.orc("show")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn(run_a, p.stdout)
-        self.assertIn("sol medium  q\n", p.stdout)
+        self.assertIn("terra high  q\n", p.stdout)
         self.assertEqual(self.orc("show", f"{run_a}/impl-a").returncode, 0)
         for ref in ("20200101-000000", "20200101-000000/x", "nope"):
             p = self.orc("show", ref)
@@ -1680,7 +1740,7 @@ class OrcTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("project history · 2 run(s)", p.stdout)
         self.assertEqual(p.stdout.count("| base |"), 2)
-        self.assertIn("implementer · sol · medium", p.stdout)
+        self.assertIn("implementer · terra · high", p.stdout)
         self.assertIn("output tok/min", p.stdout)
         self.assertNotIn("limits n/a |", p.stdout)
         self.assertIn("0 run(s)", self.orc("report", "--since", "2099-01-01").stdout)

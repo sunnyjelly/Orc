@@ -8,6 +8,13 @@ input = 2.00
 cached_input = 0.10
 output = 10.00
 
+# GPT-6.1 Terra, released 2026-10-26: orc's default worker. Requests above 272k input
+# tokens are billed at 2x input / cached and 1.5x output; orc applies the base rate.
+[openai."gpt-6.1-terra"]
+input = 1.00
+cached_input = 0.05
+output = 5.00
+
 # GPT-6.1 Sol, released 2026-09-29. Requests above 272k input tokens are billed at
 # $4 / $0.20 / $15; orc only sees per-turn totals, so it applies the base rate.
 [openai."gpt-6.1-sol"]

@@ -15,8 +15,8 @@ quota_stop = 90            # number > 0 and <= 100: stop new calls at this limit
 base = "HEAD"              # where worktrees branch from (default HEAD; commit your changes first)
 
 [defaults]                 # optional
-model = "gpt-6.1-sol"
-implementer_effort = "medium" # also explorer_effort, reviewer_effort; Sol defaults to medium
+model = "terra"               # the default; "sol" for a plan of hard tasks
+implementer_effort = "high"   # also explorer_effort, reviewer_effort; Terra defaults to high, Sol to medium
 max_repairs = 1               # nonnegative integer: automatic repair rounds
 timeout_min = 30              # positive integer
 network = false               # let implementers use the network (e.g. package installs)
@@ -24,7 +24,7 @@ network = false               # let implementers use the network (e.g. package i
 [[task]]
 id = "map-auth"            # lowercase-kebab, unique
 role = "explorer"          # explorer | reviewer (read-only) | implementer (writes, in its own worktree)
-model = "luna"             # optional: sol (default, gpt-6.1-sol) | luna (gpt-6-luna, cheap: simple scouting only) | full id
+model = "sol"              # optional: terra (default, gpt-6.1-terra) | sol (gpt-6.1-sol: harder tasks) | luna (gpt-6-luna, cheap: simple scouting only) | full id
 web = true                 # optional, explorer/reviewer only: live web search
 continues = "20260930-101010/map-auth"   # optional: resume that earlier task's Codex thread; see below
 continues_mode = "thread"   # thread (default) | summary (fresh thread seeded with earlier final result)
@@ -45,7 +45,7 @@ files = ["src/auth/**", "tests/auth/**"]   # owned paths; required when implemen
 checks = ["pytest tests/auth -q"]          # added to the plan-level checks
 effort = "high"
 verify = "codex"           # none | checks | codex | codex+adversary (default from risk: low→checks, medium→codex, high→codex+adversary)
-verify_effort = "medium"   # Sol verifier default; the adversary always uses xhigh
+verify_effort = "medium"   # default: the task model's (Terra high, Sol medium); the adversary always uses xhigh
 ```
 
 Rules `orc check` enforces:
@@ -63,6 +63,7 @@ How a task runs:
   2. orc commits the result and runs the checks.
   3. A fresh read-only verifier checks binding brief rules, shared decisions, acceptance criteria and steer amendments (plus an adversary at `codex+adversary`).
   4. If the checks or the verdict fail, orc resumes the implementer's own thread with the failures, up to `max_repairs` times, then re-checks with a fresh verifier.
+- **Terra fallback**: a fresh Terra call (worker, verifier or adversary) that fails on its own, e.g. "model is at capacity", is retried once on Sol at medium, after discarding the failed attempt's uncommitted edits. A worker that fell back stays on Sol for its repairs, steers and resumes (`fallback` in `state.json`). Resumed calls, timeouts, tool budgets and quota stops never fall back. A failed check or verdict is not a model failure: re-plan the task with `model = "sol"` if Terra keeps getting it wrong.
 - Statuses:
   - `verified`: checks and verifier passed
   - `checks-passed`: `verify = "checks"`

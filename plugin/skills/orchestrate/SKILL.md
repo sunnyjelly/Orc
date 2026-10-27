@@ -10,17 +10,18 @@ allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/orc *)
 
 **Run orc as `python3 ${CLAUDE_SKILL_DIR}/scripts/orc <command>`** (written `orc` below; use the full script path). The user's Python launcher preference takes precedence (for example `py` on Windows). If a command fails because Codex is missing or signed out, run `orc doctor` and relay its fix to the user.
 
-You are the lead engineer. Workers are Codex runs (GPT-6.1 Sol on the user's ChatGPT plan), launched by `orc`. Your job is judgment: decide the split, write precise briefs, check evidence, integrate. Aim for the best result with the least total spend: your tokens, Codex quota (ChatGPT Plus allows roughly 15–160 Sol messages per 5 hours) and the user's time. Multi-agent work costs many times the tokens of doing a task directly, so it has to earn its cost.
+You are the lead engineer. Workers are Codex runs on the user's ChatGPT plan, launched by `orc`: GPT-6.1 Terra at high effort by default, GPT-6.1 Sol at medium for harder tasks. Your job is judgment: decide the split, write precise briefs, check evidence, integrate. Aim for the best result with the least total spend: your tokens, Codex quota (ChatGPT Plus allows roughly 15–160 Sol messages per 5 hours; Terra is cheaper) and the user's time. Multi-agent work costs many times the tokens of doing a task directly, so it has to earn its cost.
 
 ## Quick consults: `orc ask` (any mode, runs in the foreground)
 
-- `orc ask "<question>"`: GPT-6.1 Sol at medium effort, read-only in the repo. Use it for a second opinion from a different model family on a design choice, diagnosis or risky assumption. State your position and ask it to attack that position.
+- `orc ask "<question>"`: GPT-6.1 Terra at high effort, read-only in the repo; `--model sol` (medium) for hard questions. Use it for a second opinion from a different model family on a design choice, diagnosis or risky assumption. State your position and ask it to attack that position.
 - `--model luna`: much cheaper, only for simple lookups and triage where depth doesn't matter.
 - `orc ask --web "…"`: a fast web lookup. The raw search results stay out of your context.
 - `orc ask --research [--depth quick|standard|deep] "…"`: multi-source web research (default standard, 10 min / 40 observed tool calls; quick 3 min / 12, deep 30 min / 100). Use one narrow question; prefer `--web` for simple lookups. Progress goes to stderr and `.progress.json`; `--timeout` and `--max-tools` override limits.
 - Put everything the consultant needs into the first question; it has not seen this conversation.
 - `orc ask --continue <ask-id|last|run/task> "…"`: a follow-up in that Codex thread, which remembers the conversation (the footer names each ask's id). With `<run>/<task>`, it asks that worker about its own work, read-only.
-- Skip it when one grep or file read answers the question. Prefer Sol; Luna never implements or verifies.
+- Skip it when one grep or file read answers the question. Luna never implements or verifies.
+- A fresh Terra call that fails (capacity, API error, no result) is retried once on Sol at medium; the summary and footer say so.
 
 ## 1. Triage (in your head, no tool calls)
 
@@ -85,9 +86,8 @@ At the end run `orc report` once and include its output in your final message, w
 
 - Every tool call re-sends your whole context. Batch commands with `&&`, and put all of a phase's tasks in one plan.
 - Keep briefs tight and complete; a missing constraint costs a whole repair round.
-- Effort:
-  - explorer: `medium`
-  - implementer: `high`
+- Model: Terra (the default) for routine reads, edits and tests; `model = "sol"` for hard design, subtle bugs, high-risk changes, or a task Terra failed.
+- Effort (Terra defaults to `high`, Sol to `medium`; set it only to deviate):
   - `xhigh`: tricky algorithms, concurrency or security
   - `max`/`ultra`: only on explicit need, since they burn quota fast
 - Don't paste run output back in prose; point to it. Keep your messages to the user short.

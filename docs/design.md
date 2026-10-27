@@ -3,7 +3,7 @@
 ## Goals
 
 1. Claude Opus 5.5 (the **lead**) decides per task whether to work solo, use one worker, or run a small team, and shows the user a clear plan: who does what and why.
-2. Workers run on the user's ChatGPT subscription via Codex (GPT-6.1 Sol, effort medium/high/xhigh).
+2. Workers run on the user's ChatGPT subscription via Codex: GPT-6.1 Terra at high effort for basic work, GPT-6.1 Sol at medium for harder tasks and as Terra's fallback.
 3. Verification is always independent of execution.
 4. The lead's tool surface and context stay minimal: few tool calls, no polling, no log reading on the happy path.
 5. At the end, one cheap call reports tokens, API-equivalent cost and usage-limit percentages for both sides.
@@ -64,20 +64,22 @@ The repo is a Claude Code plugin marketplace: `.claude-plugin/marketplace.json` 
 
 | Role | Sandbox | Effort | Where | Verification default |
 |---|---|---|---|---|
-| explorer | read-only | medium | repo root | none; the lead spot-checks key claims |
-| reviewer | read-only | medium for Sol; high otherwise | repo root | none |
-| implementer | workspace-write | medium for Sol; high otherwise | own worktree, branch `orc/<run>/<task>` | from `risk`: low → checks, medium → checks + verifier, high → checks + verifier + adversary |
-| verifier (internal) | read-only | medium for Sol; high otherwise | implementer's worktree | fresh thread every round |
+| explorer | read-only | high for Terra; medium for Sol; medium otherwise | repo root | none; the lead spot-checks key claims |
+| reviewer | read-only | high for Terra; medium for Sol; high otherwise | repo root | none |
+| implementer | workspace-write | high for Terra; medium for Sol; high otherwise | own worktree, branch `orc/<run>/<task>` | from `risk`: low → checks, medium → checks + verifier, high → checks + verifier + adversary |
+| verifier (internal) | read-only | the task model's: high for Terra; medium for Sol; high otherwise | implementer's worktree | fresh thread every round |
 | adversary (internal) | read-only | xhigh | implementer's worktree | fresh thread |
 
 ## Consults (`orc ask`)
 
 A consult is a single read-only Codex call that runs in the foreground, with no plan, worktree or verifier. There are three uses:
-- **Second opinion**: `--model sol`. A different model family catches different mistakes.
+- **Second opinion**: the default Terra, or `--model sol` for hard questions. A different model family catches different mistakes.
 - **Quick lookup**: `--web` turns on Codex live web search (`-c web_search="live"`).
 - **Deep research**: `--research`. A research preamble makes one agentic call search, cross-check and write a cited Markdown report to `.orc/asks/<id>.final.md`. The lead gets only the `## Summary` section and the file path.
 
-The default model is **GPT-6.1 Sol at medium effort**, the preferred model everywhere. `--model luna` (GPT-6 Luna, about 20× cheaper per token) is opt-in for simple lookups; use it at high effort, since Luna at low effort is too weak to be useful. Luna is never used for implementation or verification. Explicit task and plan effort settings override the model default; ask continuations retain their previous effort. The adversary still uses xhigh.
+The default model is **GPT-6.1 Terra at high effort** (`DEFAULT_MODEL`, efforts in `MODEL_EFFORTS`), for asks and plan tasks. It is about half Sol's API price per token. The lead sets `model = "sol"` (GPT-6.1 Sol, medium effort) for harder tasks: hard design, subtle bugs, high-risk changes. `--model luna` (GPT-6 Luna, about 20× cheaper per token) is opt-in for simple lookups; use it at high effort, since Luna at low effort is too weak to be useful. Luna is never used for implementation or verification. Explicit task and plan effort settings override the model default; ask continuations retain their previous effort. The adversary still uses xhigh.
+
+**Terra fallback.** Terra was released on 2026-10-26 and is sometimes at capacity. A fresh Terra call that fails on its own (Codex error, "model is at capacity", no valid final message) is retried once on `FALLBACK_MODEL` (Sol) at Sol's effort, in both `Run.codex()` and `orc ask`; `wants_fallback()` decides. The failed attempt is kept for accounting: its logs are renamed `<name>~terra.*`, and its record stays in the task's `calls` (marked `superseded`, so `task_thread()` skips it) or in `asks.jsonl` (`superseded_by`). An implementer's partial edits are discarded (`git reset --hard`, `git clean`) before the retry. A worker that fell back records `fallback` and Sol's model and effort, and `Run` reloads them, so repairs, steers and `resume` keep resuming Sol's thread with Sol. A verifier that fell back affects only that verdict. Not retried: resumed calls (Sol can't resume a Terra thread; the context would be lost), quota skips, timeouts, tool-budget stops and launcher errors, which Sol would hit too. Failed checks and failing verdicts are quality failures, not model failures; the lead re-plans those on Sol.
 
 Deep research is a flag on `ask`, not a plan feature. Research needs no worktrees, checks or merges, and one agentic call already runs many searches. For broad research that splits into independent areas, a plan with several `web = true` explorers does it in parallel.
 
@@ -94,7 +96,7 @@ Every Codex call keeps its thread, and each run or ask records the thread id, so
 - **Web taint**: a thread that ever used web search, through a `web = true` task or a web ask, is never resumed with write access, whether by `continues` on an implementer or by `steer` on one. It is tracked per thread, not per plan entry, so a read-only task that continues a web thread can't pass the taint on to a writer. Each task records `web` in `state.json`. A task that hasn't run yet is judged by its plan entry, and an unreadable plan counts as web. An implementer that continues a thread re-checks the taint right before its first call, since `orc resume` can run long after `orc check`. Every call explicitly passes `web_search="live"` or `web_search="disabled"`, overriding inherited user settings. Questions to a worker always pass `disabled`.
 - **Browsing**: `orc show` with no ref lists runs and ask conversations, newest first: two lines per run, one per conversation (questions to a worker are grouped under that worker). `--grep` also searches plans, results, prompts and answers. With a ref it prints a run's summary, a task's full result (all findings, changes, claims, thread id, where its code is), or an ask conversation from its root, with earlier answers clipped. Run, task, call and result shapes are validated before rendering: an unreadable selected record produces a clear error, while malformed unrelated records are skipped. `orc check` creates nothing, including when probing reservations.
 
-Model short names live in `MODEL_ALIASES`: `sol` → `gpt-6.1-sol`, `luna` → `gpt-6-luna`. Update them when OpenAI ships new versions.
+Model short names live in `MODEL_ALIASES`: `terra` → `gpt-6.1-terra`, `sol` → `gpt-6.1-sol`, `luna` → `gpt-6-luna`. Update them when OpenAI ships new versions.
 
 ## Principles → mechanisms
 
@@ -127,7 +129,7 @@ Quota is checked after acquiring a Codex process slot, and the completed call's 
 Everything is tested against a fake `codex` (`tests/fake_codex.py`), because Codex can't be logged in from the cloud container where this was built. Before trusting results, check these:
 
 1. **`codex exec ... resume <id> -` flag order.** orc passes the exec flags (`--json -o --output-schema -m -c -s -C`) before `resume`. If a Codex version rejects that, adjust `Run.codex()`: the order is built in one place.
-2. **Model ids and efforts.** `gpt-6.1-sol` and `gpt-6-luna` with `model_reasoning_effort` in `{low, medium, high, xhigh, max, ultra}`. Check with `codex` → `/model`.
+2. **Model ids and efforts.** `gpt-6.1-terra`, `gpt-6.1-sol` and `gpt-6-luna` with `model_reasoning_effort` in `{low, medium, high, xhigh, max, ultra}`. Check with `codex` → `/model`.
 3. **Strict output schemas.** Both schemas use `additionalProperties: false`, and every property is required, which strict structured output needs.
 4. **Rate limits in rollout files.** `orc doctor` prints the limits it finds. If they show "n/a" after a run, the rollout format changed; see `codex_limits()`.
 5. **Commits inside worktrees.** The Codex sandbox may block `.git` writes from the worker. orc commits on the worker's behalf outside the sandbox.

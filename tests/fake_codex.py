@@ -9,6 +9,7 @@ first prompt of a thread (remembered per thread, so resumes keep the mode):
   FAKE_BREAK_CHECK        -> the implementer's first attempt fails the checks
   FAKE_BREAK_UNTIL_STEER  -> every attempt fails the checks until a prompt contains STEER_FIX
   FAKE_BLOCKED            -> the worker reports status "blocked"
+  FAKE_TERRA_CAPACITY     -> any gpt-6.1-terra call fails with "Selected model is at capacity"
   (FAKE_BREAK_UNTIL_STEER and FAKE_BLOCKED also switch on when a resumed thread's prompt contains them)
 Workers report the directory they ran in ("fake worker in <dir name>").
 """
@@ -72,6 +73,10 @@ st.setdefault("invocations", []).append({"thread": thread, "resume": resume, "cw
 
 print(json.dumps({"type": "thread.started", "thread_id": thread}))
 print(json.dumps({"type": "turn.started"}))
+if "FAKE_TERRA_CAPACITY" in prompt and opt("-m") == "gpt-6.1-terra":
+    print(json.dumps({"type": "turn.failed", "error": {"message": "Selected model is at capacity. Please try a different model."}}))
+    state.write_text(json.dumps(st), encoding="utf-8")
+    sys.exit(1)
 
 if schema is None:  # orc ask: plain-text answer that echoes how it was called
     model = opt("-m")
