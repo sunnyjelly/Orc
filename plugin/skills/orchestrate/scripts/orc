@@ -537,6 +537,8 @@ def codex_limits(thread_id: str | None = None):
     for p in paths + recent_rollouts():
         snap = _limits_in_rollout(p)
         if snap:
+            if thread_id and p not in paths:
+                snap["source"] = "other"
             return snap
     return None
 
@@ -579,6 +581,11 @@ def claude_windows(snap) -> dict:
     return out
 
 
+def window_reset(before: tuple, after: tuple) -> bool:
+    return after[0] < before[0] or (after[1] is not None and before[1] is not None
+                                    and abs(float(after[1]) - float(before[1])) > 60)
+
+
 def fmt_windows(now: dict, start: dict | None = None) -> str:
     if not now:
         return "limits n/a"
@@ -587,9 +594,7 @@ def fmt_windows(now: dict, start: dict | None = None) -> str:
         s = f"{label} {pct:.0f}%"
         if start and label in start:
             before = start[label][0]
-            previous_reset = start[label][1]
-            reset = pct < before or (resets is not None and previous_reset is not None
-                                    and abs(float(resets) - float(previous_reset)) > 60)
+            reset = window_reset(start[label], (pct, resets))
             s = f"{label} {pct:.0f}% (window reset)" if reset else f"{label} {before:.0f}% → {pct:.0f}%"
         if resets and label == "5h":
             s += f" (resets {dt.datetime.fromtimestamp(float(resets)).strftime('%H:%M')})"
@@ -780,6 +785,9 @@ def load_plan(path: str) -> tuple[dict, list[str], list[str]]:
         t["checks_repeat"] = integer(t.get("checks_repeat", plan["checks_repeat"]), f"{tid}: checks_repeat", 1, 1)
         if t["writes"] and t["verify"] != "none" and not t["checks"]:
             warns.append(f"{tid}: no `checks`; add at least a test or build command so verification has hard evidence")
+    implementers = sum(t.get("role") == "implementer" for t in tasks)
+    if implementers >= 2 and not plan.get("post_merge_checks"):
+        warns.append(f"{implementers} implementers but no post_merge_checks: per-branch checks don't prove the merged result works together")
     by_id = {t.get("id"): t for t in tasks}
     for t in tasks:
         for d in t.get("after", []):
@@ -1538,7 +1546,9 @@ def state_order(st: dict) -> list[str]:
     return [tid for tid in order if isinstance(tid, str)] if isinstance(order, list) else []
 
 
-def task_line(r: dict, max_findings: int = 10, run_id: str = "<run>") -> list[str]:
+def task_line(r: dict, max_findings: int = 10, run_id: str = "<run>", full: bool = False) -> list[str]:
+    def short(value, limit):
+        return value if full else clip(value, limit)
     mark = "✓" if r["status"] in OK_STATUSES else ("~" if r["status"] in ("partial", "uncertain", "unverified") else "✗")
     usage = {k: 0 for k in USAGE_KEYS}
     for c in r.get("calls", []):
@@ -1561,21 +1571,22 @@ def task_line(r: dict, max_findings: int = 10, run_id: str = "<run>") -> list[st
     lines = [" · ".join(bits)]
     res = r.get("result") or {}
     if res.get("summary"):
-        lines.append(f"   {clip(res['summary'], 400)}")
-    if r.get("role") in ("explorer", "reviewer"):
-        lines += [f"   - {clip(f, 240)}" for f in res.get("findings", [])[:max_findings]]
-        if len(res.get("findings", [])) > max_findings:
+        lines.append(f"   {short(res['summary'], 400)}")
+    if full or r.get("role") in ("explorer", "reviewer"):
+        findings = res.get("findings", [])
+        lines += [f"   - {short(f, 240)}" for f in (findings if full else findings[:max_findings])]
+        if not full and len(findings) > max_findings:
             lines.append(f"   … {len(res['findings']) - max_findings} more: `orc show {run_id}/{r['id']}`")
     for v in r.get("verdicts", []):
-        for i in v.get("issues", [])[:5]:
-            lines.append(f"   ! [{i['severity']}] {clip(i['location'], 60)}: {clip(i['problem'], 200)}")
+        for i in v.get("issues", []) if full else v.get("issues", [])[:5]:
+            lines.append(f"   ! [{i['severity']}] {short(i['location'], 60)}: {short(i['problem'], 200)}")
         if v["verdict"] == "uncertain":
-            lines.append(f"   ? {clip(v.get('summary', ''), 240)}")
+            lines.append(f"   ? {short(v.get('summary', ''), 240)}")
     for c in r.get("checks", []):
         if c["exit"] != 0:
             lines.append(f"   ✗ `{c['cmd']}` exit {c['exit']}: {clip(tail(c['tail'], 3), 240)}")
-    for q in res.get("open_questions", [])[:3]:
-        lines.append(f"   ? {clip(q, 240)}")
+    for q in res.get("open_questions", []) if full else res.get("open_questions", [])[:3]:
+        lines.append(f"   ? {short(q, 240)}")
     if r.get("error"):
         lines.append(f"   error: {clip(r['error'], 300)}")
     if r.get("branch"):
@@ -1591,7 +1602,7 @@ def run_summary(run_dir: Path, state: dict) -> str:
         out.append(f"Post-merge smoke: {sum(c['exit'] == 0 for c in checks)}/{len(checks)} passed · {run_dir / 'post-merge-checks.log'}")
     for tid in state_order(state):
         if tid in tasks:
-            out += task_line(tasks[tid], run_id=state["id"])
+            out += task_line(tasks[tid], max_findings=5 if len(state_order(state)) > 3 else 10, run_id=state["id"])
     calls = [c for r in tasks.values() for c in r.get("calls", [])]
     usage = {k: 0 for k in USAGE_KEYS}
     for c in calls:
@@ -1833,6 +1844,8 @@ def cmd_run(a) -> int:
     repo = repo_root()
     with ExitStack() as operations:
         with file_lock(orc_dir(repo) / "locks" / "ownership.lock"):
+            for w in warns:
+                print(f"warning: {w}", file=sys.stderr)
             continues = {}
             if not errs:
                 cerrs, cwarns, continues = resolve_continues(plan, repo)
@@ -2214,12 +2227,36 @@ def cmd_report(a) -> int:
             fails = sum(1 for x in xs if x.get("error"))
             row(f"{kind} ×{len(xs)}", f"{short} · {effort}", f"{len(xs) - fails} ok" + (f", {fails} failed" if fails else ""), xs)
         first_codex = first_codex or (asks[0].get("codex_start") if asks else None)
+        if states:
+            impl = [r for s in states for r in state_tasks(s).values() if r.get("role") == "implementer"]
+            rounds, failed = 0, 0
+            for r in impl:
+                by_round = {}
+                for c in r.get("calls", []):
+                    match = re.fullmatch(r"(?:verifier|adversary)(\d+)", c.get("name", ""))
+                    if match and not c.get("skipped") and not c.get("superseded"):
+                        by_round.setdefault(match.group(1), []).append(c)
+                rounds += len(by_round)  # an errored verdict counts as uncertain, as in evaluate(), not as a catch
+                failed += sum(any(call_succeeded(c) and c["final"].get("verdict") == "fail" for c in group) for group in by_round.values())
+            repairs = sum(c.get("name", "").startswith("repair") and not c.get("skipped") for r in impl for c in r.get("calls", []))
+            passed = sum(r.get("status") in ("verified", "checks-passed") for r in impl)
+            out += ["", f"Gates: {len(impl)} implementers · {rounds} verifier rounds, {failed} failed → {repairs} repairs · {passed}/{len(impl)} passed"]
         if smoke:
             out += ["", *smoke]
+        all_calls = [c for s in states for r in state_tasks(s).values() for c in r.get("calls", [])] + asks
+        totals, approx = {}, False
+        for c in all_calls:
+            approx = approx or (c.get("codex_end") or {}).get("source") == "other"
+            start, end = codex_windows(c.get("codex_start")), codex_windows(c.get("codex_end"))
+            for label in start.keys() & end.keys():
+                if not window_reset(start[label], end[label]):
+                    totals[label] = totals.get(label, 0) + max(0, end[label][0] - start[label][0])
+        estimate = (", ".join(f"+{totals[label]:.0f}% {label}" for label in sorted(totals)) or "n/a") + (
+            " (some snapshots from other threads)" if approx and totals else "")
         out += ["", f"**Codex ({', '.join(sorted(models))}, ChatGPT plan):** {calls} calls · {fmt_tok(usage['input_tokens'] + usage['output_tokens'])} tokens "
                     f"({fmt_tok(usage['cached_input_tokens'])} cached input, {fmt_tok(usage['output_tokens'])} output) · ≈ ${cost:.2f} API-equivalent · "
-                    f"{fmt_windows(codex_windows(read_json(ORC_HOME / 'codex-limits.json')), codex_windows(first_codex))}"]
-        out.append("Time sums call durations; parallel calls overlap. Quota snapshots cover account usage, including other active sessions.")
+                    f"{fmt_windows(codex_windows(read_json(ORC_HOME / 'codex-limits.json')), codex_windows(first_codex))} · orc calls ≈ {estimate}"]
+        out.append("Time sums call durations; parallel calls overlap. Account-wide quota includes other Codex use; orc calls covers only orc calls, at account meter granularity, so concurrent use can leak in.")
         if a.calls:
             out += ["", "| call | model · effort | result | time | output tok/min | quota before → after |",
                     "|---|---|---|---|---|---|"]
@@ -2317,7 +2354,6 @@ def cmd_ask(a) -> int:
         prompt = (f"## Follow-up question from the lead (read-only)\nThis is a question about your work on `{src['root']}`, not a new task: "
                   f"you cannot modify files. The current directory is {where}. Answer in plain prose, not JSON, in at most about "
                   f"200 words unless the question needs more, and cite file:line.\n\n{question.strip()}\n")
-    codex_start = read_json(ORC_HOME / "codex-limits.json") or codex_limits()
     if research:
         prompt += (f"\n## Research limits\nDepth: {depth}. Finish within {timeout} minutes and at most {max_tools} tool calls. "
                    "Leave time for the final report; state gaps instead of exhausting the budget. "
@@ -2333,9 +2369,9 @@ def cmd_ask(a) -> int:
                                   web=web, resume=(src or {}).get("thread"), timeout_min=timeout, max_tools=max_tools)
             def log_ask(r, **extra):
                 entry = {"id": r["name"], "at": now_iso(), "question": clip(question, 300), "research": research, "web": web,
-                         "depth": depth, "claude_session": sid, "codex_start": codex_start,
+                         "depth": depth, "claude_session": sid,
                          **({"parent": src["ref"], "root": src["root"]} if src else {}), **extra,
-                         **{k: r.get(k) for k in ("model", "effort", "usage", "cost", "seconds", "thread", "error", "codex_end", "started", "finished")}}
+                         **{k: r.get(k) for k in ("model", "effort", "usage", "cost", "seconds", "thread", "error", "codex_start", "codex_end", "started", "finished")}}
                 with open(d / "asks.jsonl", "a", encoding="utf-8") as f:
                     f.write(json.dumps(entry) + "\n")
             rec, retried_from = attempt(model, effort), None
@@ -2465,12 +2501,12 @@ def cmd_show(a) -> int:
                                   + clip(item.get("aggregated_output", ""), 1000))
             return 0
         res = r.get("result") or {}
-        out = task_line(r, max_findings=1000, run_id=run_id)
+        out = task_line(r, run_id=run_id, full=True)
         out.insert(1, f"   brief: {clip(str((plan_task(runs / run_id, tid) or {}).get('brief', '')), 300)}")
         if r.get("continues"):
             out.insert(1, f"   continues {r['continues']}")
-        out += [f"   - changed {c.get('path')}: {clip(c.get('what'), 200)}" for c in res.get("changes", []) if isinstance(c, dict)]
-        out += [f"   - claim: {clip(c, 200)}" for c in res.get("claims", [])]
+        out += [f"   - changed {c.get('path')}: {c.get('what')}" for c in res.get("changes", []) if isinstance(c, dict)]
+        out += [f"   - claim: {c}" for c in res.get("claims", [])]
         wt = r.get("worktree")
         where = f"worktree {wt}" if wt and Path(wt).is_dir() else ("merged" if r.get("merged") else "")
         thread = task_thread(r)

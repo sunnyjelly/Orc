@@ -26,12 +26,12 @@ Researched 2026-09-30. Sources are listed at the bottom; the "→" lines say how
 - Models correct errors from outside sources far better than their own ("self-correction illusion"). [R4]
 - More debate among homogeneous judges doesn't add evidence. [R5] Auditing reasoning with evidence beats majority vote. [R6]
 - Anthropic's long-running harness found agents "marking features as complete without proper testing"; its fix was explicit, feature-list-driven end-to-end verification. [A2]
-  → The verification ladder:
+  → The verification ladder (defaults: low uses checks, medium adds a verifier, high adds an adversary; `verify` can also be `none`):
     1. Deterministic `checks` run by the harness, not by the model.
     2. A **fresh** read-only verifier: a new thread with no stake in the change. It gets the brief, the criteria and the diff, and sees the implementer's claims only as items to check. The implementer's own summary is withheld.
     3. At high risk, an adversarial reviewer at xhigh effort.
     4. The Opus lead as the cross-model check for high-risk diffs.
-- Repairs go back to the implementer's **own** thread, which keeps warm context. Each repair is followed by a **new** verifier. The doer fixes; a fresh checker judges.
+- Repairs go back to the implementer's **own** thread, which keeps warm context. After each repair, orc repeats the configured gates; when a verifier is configured, a **new** verifier judges.
 
 ## 4. Delegation quality
 

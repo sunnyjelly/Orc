@@ -61,8 +61,8 @@ How a task runs:
 - **implementer**:
   1. Codex works in its own worktree on branch `orc/<run>/<task>`.
   2. orc commits the result and runs the checks.
-  3. A fresh read-only verifier checks binding brief rules, shared decisions, acceptance criteria and steer amendments (plus an adversary at `codex+adversary`).
-  4. If the checks or the verdict fail, orc resumes the implementer's own thread with the failures, up to `max_repairs` times, then re-checks with a fresh verifier.
+  3. At `codex` or `codex+adversary`, a fresh read-only verifier checks binding brief rules, shared decisions, acceptance criteria and steer amendments; the latter also adds an adversary. `checks` and `none` do not run a verifier.
+  4. If the checks or the verdict fail, orc resumes the implementer's own thread with the failures, up to `max_repairs` times, then repeats the configured checks and verification.
 - **Terra fallback**: a fresh Terra call (worker, verifier or adversary) that fails on its own, e.g. "model is at capacity", is retried once on Sol at medium, after discarding the failed attempt's uncommitted edits. A worker that fell back stays on Sol for its repairs, steers and resumes (`fallback` in `state.json`). Resumed calls, timeouts, tool budgets and quota stops never fall back. A failed check or verdict is not a model failure: re-plan the task with `model = "sol"` if Terra keeps getting it wrong.
 - Statuses:
   - `verified`: checks and verifier passed
@@ -74,7 +74,7 @@ How a task runs:
   - `error`: Codex failed (missing, timed out, no valid output)
   - `stale`: an upstream task was steered after this task ran; merge the updated upstream task and write a new plan for this work. Its old branch is preserved; even an explicit merge cannot bypass stale dependencies.
   - `skipped`: a dependency didn't succeed, or the Codex quota guard stopped it; `orc resume <run>` runs skipped tasks later
-- `continues`: the task's first call resumes the Codex thread of `<run>/<task>` from any earlier run, instead of starting cold. The worker keeps its memory of the earlier work. It still gets the full brief, runs in a fresh worktree (or the usual read-only directory), and goes through the normal checks, verification and repairs. The prompt tells it whether its earlier changes are already in the checkout (merged) or not (then it must redo what it still needs). Use it for follow-up work on merged tasks, redoing stale work, or implementing what an explorer worked out. Rules:
+- `continues`: the task's first call resumes the Codex thread of `<run>/<task>` from any earlier run, instead of starting cold. The worker keeps its memory of the earlier work. It still gets the full brief, runs in a fresh worktree (or the usual read-only directory), and goes through the normal checks, verification and repairs. The prompt tells it whether its earlier changes are already in the checkout (merged) or not (then it must redo what it still needs). Use it for follow-up work on merged tasks, redoing stale work, or a phase-2 implementer continuing a non-web explorer to keep its context warm. Rules:
   - The thread belongs to the new task from the moment its run starts. Steer, question or continue that task from now on; orc refuses the old one, and any task while it is running.
   - One thread per plan.
   - An implementer can't continue a thread that ever used web search. Keep the same model, so the prompt cache carries over.
@@ -83,7 +83,7 @@ How a task runs:
 - `resume` reuses a quota-skipped implementer's existing worktree and call history. Partial merges retain branches and worktrees while unfinished tasks still need them. Merge refuses to run during another Git operation and leaves dirty worktrees available for inspection.
 - Checks are POSIX shell (Git Bash on Windows). They run on your machine, outside Codex's sandbox, on code a worker wrote. Only use `checks` you would run yourself on an untrusted branch.
 
-`checks_repeat` can also be set in defaults or on a task (task overrides plan, plan overrides defaults). `post_merge_checks` is plan-level and opt-in. See [execution.md](execution.md) for Windows dependencies, read-only limitations, deadlines and smoke-check effects.
+`checks_repeat` can also be set in defaults or on a task (task overrides plan, plan overrides defaults). `post_merge_checks` is plan-level; for 2+ implementers, exercise the combined result with it. `orc check` warns if it is missing. For checks-only results or weak checks, quickly inspect the diff; trust verified results. See [execution.md](execution.md) for Windows dependencies, read-only limitations, deadlines and smoke-check effects.
 
 `steer` messages are saved as specification amendments. Repeated `--acceptance "criterion"` replaces acceptance criteria; repeated `--allow-file path` extends ownership explicitly, refusing overlaps with tasks that can run in parallel. A verifier finding in an existing file outside the task's ownership becomes `blocked: repair needs file ownership` instead of consuming futile repair rounds.
 

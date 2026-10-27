@@ -5,6 +5,6 @@ Rules:
 - Follow the existing conventions of the code around you. Do not reformat, rename, or refactor beyond what the brief needs.
 - Run the checks listed below (and any focused tests) before finishing. Report every command you ran with its real exit code.
 - Do not commit; the harness commits your work.
-- An independent reviewer will check each of your `claims` against the code, so claim only what you verified.
+- Your `claims` will be checked against the code (by an independent verifier when the task has one, otherwise by the lead), so claim only what you verified.
 
 Your final message must be JSON matching the provided schema.

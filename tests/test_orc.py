@@ -101,6 +101,141 @@ class OrcTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("overlapping files", p.stdout)
 
+    def test_integration_warning(self):
+        warning = "implementers but no post_merge_checks"
+        p = self.orc("check", "plan.toml")
+        self.assertEqual(p.stdout.count(warning), 1)
+        p = self.orc("run", "plan.toml")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stderr.count(warning), 1)
+        (self.repo / "checked.toml").write_text('post_merge_checks = ["true"]\n' + PLAN)
+        self.assertNotIn(warning, self.orc("check", "checked.toml").stdout)
+        self.assertNotIn(warning, self.orc("check", self.review_plan()).stdout)
+
+    def test_full_show_compact_summary_and_report_gates_quota(self):
+        self.assertEqual(self.orc("run", "plan.toml").returncode, 0)
+        rid, state = self.state()
+        scout = state["tasks"]["scout"]
+        long = "long-" + "x" * 300
+        scout["result"]["findings"] = [long + str(i) for i in range(7)]
+        scout["result"]["claims"] = [long]
+        scout["result"]["open_questions"] = [long] * 4
+        scout["verdicts"] = [{"kind": "verifier1", "verdict": "fail", "issues":
+                              [{"severity": "high", "location": long, "problem": long}] * 6}]
+        def snap(pct, reset=1000):
+            return {"rate_limits": {"primary": {"used_percent": pct, "window_minutes": 300, "resets_at": reset},
+                                    "secondary": {"used_percent": pct, "window_minutes": 10080, "resets_at": reset}}}
+        calls = state["tasks"]["impl-a"]["calls"]
+        for c in [c for r in state["tasks"].values() for c in r.get("calls", [])]:
+            c["codex_start"], c["codex_end"] = None, None
+        calls[0]["codex_start"], calls[0]["codex_end"] = snap(10), snap(13)
+        calls[1]["codex_start"], calls[1]["codex_end"] = snap(13), snap(2, 2000)
+        calls.extend([{"name": "verifier-skipped", "skipped": True}, {"name": "adversary-skipped", "skipped": True},
+                      {"name": "repair-skipped", "skipped": True}])
+        (self.repo / ".orc" / "runs" / rid / "state.json").write_text(json.dumps(state))
+        show = self.orc("show", rid + "/scout").stdout
+        self.assertIn(long + "6", show)
+        self.assertIn("claim: " + long, show)
+        self.assertEqual(show.count("[high]"), 6)
+        self.assertEqual(show.count("? " + long), 4)
+        summary = self.orc("show", rid).stdout  # the run summary keeps its clips and caps
+        self.assertNotIn(long, summary)
+        self.assertIn("… 2 more: `orc show " + rid + "/scout`", summary)
+        self.assertEqual(summary.count("[high]"), 5)
+        self.assertEqual(summary.count("? long-"), 3)
+        report = self.orc("report", rid).stdout
+        self.assertIn("orc calls ≈ +3% 5h, +3% wk", report)
+        self.assertIn("Gates: 3 implementers · 3 verifier rounds, 1 failed → 2 repairs · 3/3 passed", report)
+        self.assertIn("concurrent use can leak in", report)
+
+    def test_codex_limits_marks_other_thread_fallback(self):
+        mod = runpy.run_path(str(ORC[1]))
+        sessions = self.tmp / "codex" / "sessions" / "2026" / "01" / "01"
+        sessions.mkdir(parents=True)
+        (sessions / "rollout-requested.jsonl").write_text('{}\n')
+        (sessions / "rollout-other.jsonl").write_text(json.dumps({"rate_limits": {"primary": {"used_percent": 10}}}) + "\n")
+        mod["codex_limits"].__globals__["CODEX_HOME"] = self.tmp / "codex"
+        self.assertEqual(mod["codex_limits"]("requested")["source"], "other")
+        self.assertNotIn("source", mod["codex_limits"]("other"))
+
+    def test_gate_counts_adversary_as_same_round_and_failures_once(self):
+        p = self.orc("run", self.review_plan(verify="codex+adversary"))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rid, state = self.state()
+        calls = state["tasks"]["base"]["calls"]
+        self.assertEqual([c["name"] for c in calls], ["worker", "verifier1", "adversary1"])
+        self.assertIn("Gates: 1 implementers · 1 verifier rounds, 0 failed", self.orc("report", rid).stdout)
+        calls[1]["final"]["verdict"] = calls[2]["final"]["verdict"] = "fail"
+        calls.extend([{"name": "verifier9", "skipped": True, "final": {"verdict": "fail"}},
+                      {"name": "adversary10~terra", "superseded": True, "final": {"verdict": "fail"}}])
+        (self.repo / ".orc" / "runs" / rid / "state.json").write_text(json.dumps(state))
+        self.assertIn("Gates: 1 implementers · 1 verifier rounds, 1 failed", self.orc("report", rid).stdout)
+
+    def test_gate_counts_fallback_verifier_once(self):
+        self.fake_script(f'''
+            import json, subprocess, sys
+            from pathlib import Path
+            args = sys.argv[1:]
+            prompt = sys.stdin.read()
+            output = Path(args[args.index("-o") + 1])
+            if output.name.startswith("verifier") and args[args.index("-m") + 1] == "gpt-6.1-terra":
+                output.write_text(json.dumps({{"verdict": "fail", "summary": "superseded", "issues": [], "criteria": []}}))
+                print(json.dumps({{"type": "turn.failed", "error": {{"message": "at capacity"}}}}))
+                sys.exit(1)
+            sys.exit(subprocess.run([sys.executable, {str(ROOT / 'tests' / 'fake_codex.py')!r}] + args, input=prompt, text=True).returncode)
+        ''')
+        p = self.orc("run", self.review_plan(verify="codex+adversary"))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rid, state = self.state()
+        calls = state["tasks"]["base"]["calls"]
+        retired = next(c for c in calls if c["name"] == "verifier1~terra")
+        self.assertTrue(retired["superseded"])
+        self.assertEqual(retired["final"]["verdict"], "fail")
+        self.assertIn("Gates: 1 implementers · 1 verifier rounds, 0 failed", self.orc("report", rid).stdout)
+
+    def test_ask_retry_uses_each_calls_quota_start(self):
+        sessions = self.tmp / "codex" / "sessions" / "2026" / "01" / "01"
+        sessions.mkdir(parents=True)
+        def snap(pct):
+            return {"rate_limits": {"primary": {"used_percent": pct, "window_minutes": 300, "resets_at": 4102444800}}}
+        seed = sessions / "rollout-seed.jsonl"
+        seed.write_text(json.dumps(snap(10)) + "\n")
+        os.utime(seed, (2000000000, 2000000000))
+        home = Path(self.env["ORC_HOME"])
+        home.mkdir()
+        (home / "codex-limits.json").write_text(json.dumps(snap(2)))
+        self.fake_script('''
+            import json, os, sys
+            from pathlib import Path
+            args = sys.argv
+            sys.stdin.read()
+            first = args[args.index("-m") + 1] == "gpt-6.1-terra"
+            thread = "first" if first else "second"
+            pct = 13 if first else 15
+            path = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "01" / "01" / ("rollout-" + thread + ".jsonl")
+            path.write_text(json.dumps({"rate_limits": {"primary": {"used_percent": pct, "window_minutes": 300, "resets_at": 4102444800}}}) + "\\n")
+            os.utime(path, (2000000001 if first else 2000000002,) * 2)
+            print(json.dumps({"type": "thread.started", "thread_id": thread}))
+            if first:
+                print(json.dumps({"type": "turn.failed", "error": {"message": "at capacity"}}))
+                sys.exit(1)
+            Path(args[args.index("-o") + 1]).write_text("answer")
+        ''')
+        p = self.orc("ask", "retry")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        asks = self.asks()
+        self.assertEqual([x["codex_start"]["rate_limits"]["primary"]["used_percent"] for x in asks], [10, 13])
+        self.assertEqual([x["codex_end"]["rate_limits"]["primary"]["used_percent"] for x in asks], [13, 15])
+        self.assertIn("orc calls ≈ +5% 5h", self.orc("report").stdout)
+
+    def test_skipped_ask_has_no_call_quota_start(self):
+        home = Path(self.env["ORC_HOME"])
+        home.mkdir()
+        (home / "codex-limits.json").write_text(json.dumps({"rate_limits": {"primary": {
+            "used_percent": 95, "window_minutes": 300, "resets_at": 4102444800}}}))
+        self.assertEqual(self.orc("ask", "q").returncode, 1)
+        self.assertIsNone(self.asks()[-1]["codex_start"])
+
     def test_full_cycle(self):
         # Claude statusline snapshot + a transcript with two assistant messages (one duplicated line)
         transcript = self.tmp / "t.jsonl"

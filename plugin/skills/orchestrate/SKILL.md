@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: Lead coding tasks with OpenAI Codex (GPT) workers through the bundled `orc` CLI. Use for any non-trivial coding, refactoring, debugging, review or codebase-research task. Decides whether to do the work yourself, hand it to one worker, or run a small team; plans it, runs it with independent verification, and ends with a token, cost and usage-limit report.
+description: Lead coding tasks with OpenAI Codex (GPT) workers through the bundled `orc` CLI. Use for any non-trivial coding, refactoring, debugging, review or codebase-research task. Decides whether to do the work yourself, hand it to one worker, or run a small team; plans it, runs it with risk-based verification, and ends with a token, cost and usage-limit report.
 license: MIT
 compatibility: Claude Code with a local shell. Needs Python 3.11+, git, and the Codex CLI signed in (`codex login`).
 allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/orc *)
@@ -40,12 +40,12 @@ Pick the smallest mode that does the job well:
 
 ## 2. Plan (Single and Team)
 
-1. Look around only as much as good briefs require. If that look-around is itself big, make it an explorer task in a first plan and write the implementation plan after it returns.
+1. Look around only as much as good briefs require. If that look-around is big, use an explorer first; in phase 2, set `continues = "<run>/<explorer>"` on the implementer if the explorer did not use web.
 2. Commit your own pending changes first: worktrees start from HEAD.
 3. Write `.orc/plan.toml`. Read `reference/plan-format.md` and `reference/briefs.md` the first time in a session.
 4. Run `orc check .orc/plan.toml`. Show the user its table plus at most 3 lines: why this split, what you will do yourself, why this verification level. Wait for approval, unless the user already told you to proceed autonomously.
 
-**Verification is separate from execution by design.** Implementers never grade themselves. `orc` runs the plan's checks (tests, lint, build), then a fresh read-only verifier with no stake in the change. At risk high, it also runs an adversarial reviewer. Choose `risk` honestly:
+**Verification is separate from execution by design.** Implementers never grade themselves. `orc` runs the plan's checks (tests, lint, build). Low risk defaults to checks only, medium adds a fresh read-only verifier, and high adds an adversary; `verify` can also be `none`. Choose `risk` honestly:
 - low: docs, config, isolated scripts
 - medium: normal feature work (the default)
 - high: auth, payments, data migrations, concurrency, public APIs
@@ -63,15 +63,15 @@ Always give implementers real `checks`: exit codes beat opinions.
 
 The run summary normally has everything you need. Open files under `.orc/runs/` only to debug a failure.
 
-- **verified / checks-passed**: at low or medium risk, trust the gates; don't re-review the whole diff. At high risk, read the diff yourself: you are the cross-model check.
+- **verified / checks-passed**: trust verified results, but quickly inspect the diff for checks-only results or weak checks. At high risk, read the diff yourself: you are the cross-model check.
 - **failed / uncertain**: take the cheapest fix that works:
   - Trivial: fix it yourself after merging.
-  - Clear feedback: `orc steer <run> <task> "<specific fix>"`. This reuses the worker's warm context and re-checks and re-verifies automatically. If tasks were skipped because of the failure, `orc resume <run>` runs them afterwards.
+  - Clear feedback: `orc steer <run> <task> "<specific fix>"`. This reuses the worker's warm context and repeats the configured checks and verification automatically. If tasks were skipped because of the failure, `orc resume <run>` runs them afterwards.
   - Wrong approach: rewrite the brief and re-plan.
   - After two failed rounds on the same task, do it yourself or ask the user.
 - Explorer findings are claims: spot-check the one or two that your decisions rest on.
 - `orc merge <run> && <project test command>` in one call (merge exits non-zero on a conflict), then fix anything the combined result breaks.
-- Declare `post_merge_checks` for live host smoke tests and `checks_repeat` for concurrency tests. After merge, exercise real entry points once; mocked OS/API tests are not live evidence.
+- For 2+ implementers, declare `post_merge_checks` that exercise the combined result; use them for live host smoke tests and `checks_repeat` for concurrency tests. After merge, exercise real entry points once; mocked OS/API tests are not live evidence.
 - `blocked` means the worker stopped to ask something: answer its open question with `orc steer`, or re-plan.
 - Steers are binding spec amendments seen by verifiers. Use repeated `--acceptance "criterion"` to replace acceptance, or `--allow-file path` for explicit ownership extensions; Orc rejects conflicts with parallel tasks.
 - **stale**: an upstream task was steered after this task ran. Merge the updated upstream task, then write a new plan for the stale work; its old branch is preserved.

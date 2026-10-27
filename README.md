@@ -1,6 +1,6 @@
 # orc: Claude leads, Codex works
 
-Claude Code acts as the lead engineer. It delegates work to OpenAI Codex workers that run on your ChatGPT subscription, and every change is checked by a verifier that did not write it. At the end you get one report: tokens, API-equivalent cost, and 5-hour/weekly limit usage for both Claude and Codex.
+Claude Code acts as the lead engineer. It delegates work to OpenAI Codex workers that run on your ChatGPT subscription, with verification chosen by risk: low defaults to checks, medium adds an independent verifier, and high adds an adversary. Verification can also be set to `none`. At the end you get one report: tokens, API-equivalent cost, and 5-hour/weekly limit usage for both Claude and Codex.
 
 ```
 you ──► Claude (lead, skill "orchestrate")
@@ -10,7 +10,7 @@ you ──► Claude (lead, skill "orchestrate")
           ├─ `orc run` (one background call)
           │     explorer / reviewer   read-only Codex
           │     implementer           Codex in its own git worktree
-          │        → harness checks → fresh verifier (→ adversary) → repair on the same thread
+          │        → checks → verifier at medium/high (→ adversary at high) → repair on the same thread
           ├─ `orc merge && tests`
           └─ `orc report` → tokens · ≈API $ · limit % (Claude + Codex)
 ```
@@ -91,7 +91,7 @@ Open any git repo in Claude Code and ask for work as usual. Use the strongest Cl
 | `orc show RUN\|RUN/TASK\|ASK-ID` | Re-reads a run summary, a task's full result and thread id, or a whole ask conversation. |
 | `orc check [PLAN]` | Without a plan, prints limits. With a plan, validates types, roles, acceptance, ownership, dependencies and the Git base, then prints the plan and call estimate. No Codex calls. |
 | `orc run PLAN [--only a,b]` | Runs the plan. Prints progress to stderr and a compact summary to stdout. Exit 0 if everything passed, 2 otherwise. |
-| `orc steer RUN TASK "msg"` | Follow-up on a task's own Codex thread (warm context), then re-check and re-verify. For more work after a task is merged, use `continues = "RUN/TASK"` on a task in a new plan instead. |
+| `orc steer RUN TASK "msg"` | Follow-up on a task's own Codex thread (warm context), then repeat the configured checks and verification. For more work after a task is merged, use `continues = "RUN/TASK"` on a task in a new plan instead. |
 | `orc merge [RUN] [TASK…]` | Merges verified branches (`--no-ff`) and removes clean worktrees once dependents no longer need them. Refuses stale dependencies or an existing Git operation; exits 1 at the first conflict. |
 | `orc clean [RUN]` | Removes a run's leftover worktrees and branches. |
 | `orc report [RUN…] [--all] [--since DATE] [--calls]` | Explicit scope, models, tokens, ≈ API cost and limit %. Without session detection, includes all project history; `--calls` adds per-call rates and quota snapshots. |
@@ -123,7 +123,7 @@ tests/                               end-to-end tests against a fake codex
 
 Run state goes to `<repo>/.orc/runs/` (git-excluded automatically). Worktrees, usage snapshots and the `orc setup` copy go to `~/.orc/`.
 
-Research supports `--depth quick|standard|deep` (3/10/30 minutes and 12/40/100 observed tool calls), with progress on stderr and in `.progress.json`. Override with `--timeout` / `--max-tools`. Steers reach verifiers as binding spec amendments; `--acceptance` replaces criteria and `--allow-file` extends ownership explicitly. Passing gates are bound to commits/specifications, and merge/clean are serialized with run mutations. Plan `checks_repeat` catches intermittent failures, and optional `post_merge_checks` exercises the combined result on the real host. Add `continues_mode = "summary"` for a fresh follow-up thread. Details and Windows dependency guidance: [execution.md](plugin/skills/orchestrate/reference/execution.md).
+For research limits, integration checks, follow-ups and accounting details, see [execution.md](plugin/skills/orchestrate/reference/execution.md) and [plan-format.md](plugin/skills/orchestrate/reference/plan-format.md).
 
 ## Tests
 
@@ -143,7 +143,9 @@ The tests run against `tests/fake_codex.py`. They cover:
 - malformed settings, numeric plan validation, and quota recovery and queueing
 - the quota guard
 - report scoping and setup
-- the packaged skills They have not yet run against real Codex; see the "Assumptions to verify" section in `docs/design.md`.
+- the packaged skills
+
+Live on codex-cli 0.164.0 with ChatGPT Plus: `orc ask` (including `--web`), `orc run` with web explorers and a reviewer, Terra and Sol model IDs and reasoning effort, and rollout rate-limit snapshots (5h 13% → 17%). Implementer worktrees, exec thread continuation (`resume <id>`), steer and merge remain unverified live; see [live validation](docs/design.md#live-validation-and-remaining-assumptions).
 
 ## License
 
